@@ -1,0 +1,26 @@
+[project]
+name = "mini-code-index"
+version = "0.1.0"
+description = "Minimal, test-driven code indexing wheel (learning project)."
+requires-python = ">=3.9"
+dependencies = [
+  "pygments>=2.17",
+  "charset-normalizer>=3.4",
+  "tree-sitter>=0.22",
+  "tree-sitter-language-pack>=0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+
