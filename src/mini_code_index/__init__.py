@@ -1,3 +1,10 @@
-__all__ = ["chunking"]
+__all__ = [
+	"chunking",
+	"db",
+	"embedding",
+	"vectorise",
+	"query",
+	"cli",
+]
 
 

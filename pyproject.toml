@@ -10,6 +10,9 @@ dependencies = [
   "tree-sitter-language-pack>=0.6",
 ]
 
+[project.scripts]
+mini-code-index = "mini_code_index.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
