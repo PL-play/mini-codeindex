@@ -44,6 +44,7 @@ def test_chunk_path_python_file_smoke(tmp_path: Path):
     path = _write(tmp_path / "sample.py", code)
 
     cfg = Config(chunk_size=115, overlap_ratio=0.0)
+
     chunks = list(TreeSitterChunker(cfg).chunk(path))
 
     print("\n--- produced chunks ---")  # visible under `pytest -s`

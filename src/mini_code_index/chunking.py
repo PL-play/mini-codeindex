@@ -45,6 +45,7 @@ class Config:
     encoding: str = "utf8"  # use "_auto" to auto-detect with charset-normalizer
     chunk_filters: dict[str, list[str]] = None  # language -> patterns, "*" for default
     filetype_map: dict[str, list[str]] = None  # language -> [regex over extension]
+    trim_gap_blank_lines: bool = True
 
     def __post_init__(self) -> None:
         if self.chunk_filters is None:
@@ -215,7 +216,23 @@ class TreeSitterChunker:
     def _chunk_node(self, node: "Node", text_bytes: bytes) -> Generator[Chunk, None, None]:
         current_chunk = ""
         current_start: "Point | None" = None
+        current_end: "Point | None" = None
         prev_node: "Node | None" = None
+
+        def _normalize_gap_text(gap: str) -> str:
+            if not self.config.trim_gap_blank_lines:
+                return gap
+            if not gap:
+                return ""
+
+            lines = gap.splitlines(keepends=True)
+            kept = [ln for ln in lines if ln.strip() != ""]
+            if kept:
+                return "".join(kept)
+
+            if "\n" in gap:
+                return "\n"
+            return " "
 
         # Leaf node: fallback to string chunking.
         if len(node.children) == 0 and getattr(node, "text", None):
@@ -232,18 +249,15 @@ class TreeSitterChunker:
             if self.config.chunk_size >= 0 and len(child_text) > self.config.chunk_size:
                 if current_chunk:
                     assert current_start is not None
+                    assert current_end is not None
                     yield Chunk(
                         text=current_chunk,
                         start=current_start,
-                        end=Point(  # type: ignore
-                            row=current_start.row + current_chunk.count("\n"),
-                            column=len(current_chunk.split("\n")[-1]) - 1
-                            if "\n" in current_chunk
-                            else current_start.column + len(current_chunk) - 1,
-                        ),
+                        end=current_end,
                     )
                     current_chunk = ""
                     current_start = None
+                    current_end = None
                     prev_node = None
 
                 yield from self._chunk_node(child, text_bytes)
@@ -253,6 +267,8 @@ class TreeSitterChunker:
                 current_chunk = child_text
                 sp = child.start_point
                 current_start = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+                ep = child.end_point
+                current_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
                 prev_node = child
                 continue
 
@@ -261,7 +277,7 @@ class TreeSitterChunker:
             gap_text = ""
             if prev_node is not None:
                 gap_bytes = text_bytes[prev_node.end_byte : child.start_byte]
-                gap_text = gap_bytes.decode()
+                gap_text = _normalize_gap_text(gap_bytes.decode())
 
             # try append if fits (including the gap)
             if self.config.chunk_size < 0 or (
@@ -269,36 +285,32 @@ class TreeSitterChunker:
             ):
                 current_chunk += gap_text + child_text
                 prev_node = child
+                ep = child.end_point
+                current_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
                 continue
 
             # otherwise flush and start new
             assert current_start is not None
+            assert current_end is not None
             yield Chunk(
                 text=current_chunk,
                 start=current_start,
-                end=Point(  # type: ignore
-                    row=current_start.row + current_chunk.count("\n"),
-                    column=len(current_chunk.split("\n")[-1]) - 1
-                    if "\n" in current_chunk
-                    else current_start.column + len(current_chunk) - 1,
-                ),
+                end=current_end,
             )
             current_chunk = child_text
             sp = child.start_point
             current_start = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+            ep = child.end_point
+            current_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
             prev_node = child
 
         if current_chunk:
             assert current_start is not None
+            assert current_end is not None
             yield Chunk(
                 text=current_chunk,
                 start=current_start,
-                end=Point(  # type: ignore
-                    row=current_start.row + current_chunk.count("\n"),
-                    column=len(current_chunk.split("\n")[-1]) - 1
-                    if "\n" in current_chunk
-                    else current_start.column + len(current_chunk) - 1,
-                ),
+                end=current_end,
             )
 
     def chunk(self, path: str) -> Generator[Chunk, None, None]:
