@@ -23,6 +23,32 @@ except Exception:  # pragma: nocover
     _HAS_TREESITTER = False
 
 
+# Common extension -> tree-sitter language mapping.
+# Keys must be supported by `tree_sitter_language_pack.get_parser()`.
+# Patterns are regexes applied via `re.search(pattern, ext)` where `ext` has no leading dot.
+DEFAULT_FILETYPE_MAP: dict[str, list[str]] = {
+    "python": [r"^(py|pyi)$"],
+    "lua": [r"^lua$"],
+    "javascript": [r"^(js|mjs|cjs)$"],
+    "typescript": [r"^(ts|tsx)$"],
+    "java": [r"^java$"],
+    "go": [r"^go$"],
+    "rust": [r"^rs$"],
+    "c": [r"^c$"],
+    "cpp": [r"^(cc|cpp|cxx|hpp|hh|hxx)$"],
+    "html": [r"^(html|htm)$"],
+    "css": [r"^css$"],
+    "sql": [r"^sql$"],
+    "php": [r"^(php|phtml)$"],
+    "ruby": [r"^rb$"],
+    "json": [r"^json$"],
+    "toml": [r"^toml$"],
+    "yaml": [r"^(yml|yaml)$"],
+    "bash": [r"^(sh|bash)$"],
+    "markdown": [r"^(md|markdown)$"],
+}
+
+
 @dataclass
 class Chunk:
     """
@@ -51,7 +77,8 @@ class Config:
         if self.chunk_filters is None:
             self.chunk_filters = {}
         if self.filetype_map is None:
-            self.filetype_map = {}
+            # Default to a common mapping, while avoiding shared mutable defaults.
+            self.filetype_map = {k: v.copy() for k, v in DEFAULT_FILETYPE_MAP.items()}
         if not (0 <= self.overlap_ratio < 1):
             raise ValueError("overlap_ratio must be in [0, 1).")
 
@@ -182,9 +209,9 @@ class TreeSitterChunker:
 
     def _get_parser_from_config(self, file_path: str):
         if not _HAS_TREESITTER:
-            return None
+            return None, None
         if not self.config.filetype_map:
-            return None
+            return None, None
 
         ext = os.path.splitext(file_path)[1]
         if ext.startswith("."):
@@ -193,8 +220,8 @@ class TreeSitterChunker:
             language = _language.lower()
             for pat in patterns:
                 if re.search(pat, ext):
-                    return get_parser(language)  # type: ignore[arg-type]
-        return None
+                    return get_parser(language), language  # type: ignore[arg-type]
+        return None, None
 
     def _get_parser_by_guess(self, file_path: str, content: str):
         if not _HAS_TREESITTER:
@@ -328,8 +355,7 @@ class TreeSitterChunker:
             )
             return
 
-        parser = self._get_parser_from_config(path)
-        language = None
+        parser, language = self._get_parser_from_config(path)
         if parser is None:
             parser, language = self._get_parser_by_guess(path, content)
 
