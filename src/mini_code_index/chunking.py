@@ -340,31 +340,60 @@ class TreeSitterChunker:
                 end=current_end,
             )
 
-    def chunk(self, path: str) -> Generator[Chunk, None, None]:
-        if not os.path.isfile(path):
-            raise FileNotFoundError(path)
+    def chunk_str(
+        self,
+        content: str,
+        *,
+        path: Optional[str] = None,
+        language: Optional[str] = None,
+        start_pos: Optional["Point"] = None,
+    ) -> Generator[Chunk, None, None]:
+        """Chunk a raw string.
 
-        content = self._load_file_text(path)
+        Parser selection priority:
+        1) If `path` is provided, try config.filetype_map then pygments guessing.
+        2) Else if `language` is provided, try `tree_sitter_language_pack.get_parser(language)`.
+        3) Else fall back to `StringChunker`.
+
+        `start_pos` controls the start Point for the fallback StringChunker only.
+        """
+
+        if start_pos is None:
+            start_pos = Point(row=1, column=0)  # type: ignore
+
         if self.config.chunk_size < 0 and content:
+            # Yield the whole content as one chunk.
             lines = content.splitlines(True)
             end_col = len(lines[-1]) - 1 if lines else 0
+            end_row = start_pos.row + (len(lines) - 1 if lines else 0)
+            end_column = start_pos.column + end_col if len(lines) <= 1 else end_col
             yield Chunk(
                 text=content,
-                start=Point(row=1, column=0),  # type: ignore
-                end=Point(row=len(lines) if lines else 1, column=end_col),  # type: ignore
+                start=start_pos,
+                end=Point(row=end_row, column=end_column),  # type: ignore
             )
             return
 
-        parser, language = self._get_parser_from_config(path)
-        if parser is None:
-            parser, language = self._get_parser_by_guess(path, content)
+        parser = None
+        lang = None
+        if path is not None:
+            parser, lang = self._get_parser_from_config(path)
+            if parser is None:
+                parser, lang = self._get_parser_by_guess(path, content)
+        elif language is not None and _HAS_TREESITTER:
+            try:
+                lang = language.lower()
+                parser = get_parser(lang)  # type: ignore[arg-type]
+            except LookupError:
+                parser = None
+                lang = None
 
-        # No tree-sitter parser -> fallback to naive string chunking of whole file.
+        # No tree-sitter parser -> fallback to naive string chunking.
         if parser is None:
-            yield from self._fallback.chunk(content, start_pos=Point(row=1, column=0))  # type: ignore
+            yield from self._fallback.chunk(content, start_pos=start_pos)
             return
 
-        pattern_str = self._build_filter_pattern(language)
+        pattern_str = self._build_filter_pattern(lang)
         content_bytes = content.encode()
         tree = parser.parse(content_bytes)
         chunks = self._chunk_node(tree.root_node, content_bytes)
@@ -376,5 +405,12 @@ class TreeSitterChunker:
                     yield c
         else:
             yield from chunks
+
+    def chunk(self, path: str) -> Generator[Chunk, None, None]:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+
+        content = self._load_file_text(path)
+        yield from self.chunk_str(content, path=path, start_pos=Point(row=1, column=0))  # type: ignore
 
 

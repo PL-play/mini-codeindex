@@ -351,6 +351,72 @@ def test_chunk_filters_java_can_filter_package_declaration_print(tmp_path: Path)
     assert not any(c.text.lstrip().startswith("package") for c in chunks)
 
 
+def test_chunk_str_python_by_language_smoke() -> None:
+    _require_treesitter()
+
+    code = textwrap.dedent(
+        """\
+        import os
+
+        def add(a, b):
+            return a + b
+        """
+    )
+
+    cfg = Config(chunk_size=80, overlap_ratio=0.0)
+    chunker = TreeSitterChunker(cfg)
+    chunks = list(chunker.chunk_str(code, language="python"))
+
+    assert len(chunks) >= 1
+    assert any("def add" in c.text for c in chunks)
+
+
+def test_chunk_str_applies_chunk_filters_python() -> None:
+    _require_treesitter()
+
+    code = textwrap.dedent(
+        """\
+        import os
+
+        def f():
+            return 1
+        """
+    )
+
+    # Small chunk size to encourage a separate chunk starting with "import".
+    cfg = Config(chunk_size=25, overlap_ratio=0.0, chunk_filters={"python": [r"import"]})
+    chunks = list(TreeSitterChunker(cfg).chunk_str(code, language="python"))
+
+    assert any("def f" in c.text for c in chunks)
+    assert not any(c.text.lstrip().startswith("import") for c in chunks)
+
+
+def test_chunk_str_falls_back_to_string_chunker_when_no_parser() -> None:
+    # No `path` and no `language` => no parser selection => fallback.
+    cfg = Config(chunk_size=2, overlap_ratio=0.0)
+    chunks = list(TreeSitterChunker(cfg).chunk_str("abcd"))
+    assert [c.text for c in chunks] == ["ab", "cd"]
+
+
+def test_chunk_delegates_to_chunk_str(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _write(tmp_path / "x.py", "print('hi')\n")
+
+    cfg = Config(chunk_size=10, overlap_ratio=0.0)
+    chunker = TreeSitterChunker(cfg)
+
+    called = {"ok": False}
+
+    def _fake_chunk_str(content: str, *, path=None, **_kwargs):
+        called["ok"] = True
+        assert path is not None
+        assert "print" in content
+        yield from []
+
+    monkeypatch.setattr(chunker, "chunk_str", _fake_chunk_str)
+    list(chunker.chunk(path))
+    assert called["ok"] is True
+
+
 
 
 
