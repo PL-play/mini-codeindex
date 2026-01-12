@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import textwrap
 
 import pytest
 
-from mini_code_index.chunking import Config, TreeSitterChunker
+from mini_code_index.chunking import Config, ScopeKind, TreeSitterChunker
 
 
 def _assert_python_parser(parser) -> None:
@@ -88,6 +89,10 @@ def test_config_overlap_ratio_validation():
         Config(overlap_ratio=-0.01)
     with pytest.raises(ValueError):
         Config(overlap_ratio=1.0)
+
+def test_default_scope_boundaries_are_file_type_function():
+    cfg = Config()
+    assert cfg.boundary == ScopeKind.FILE
 
 
 def test_gap_trim_blank_lines_option_python(tmp_path: Path):
@@ -286,6 +291,11 @@ def test_chunk_path_java_file_multiple_chunks_print(tmp_path: Path):
         import java.util.*;
 
         public class A {
+        
+            public int a;
+            
+            public static int b;
+            
             public static int add(int a, int b) {
                 return a + b;
             }
@@ -329,6 +339,13 @@ def test_chunk_filters_java_can_filter_package_declaration_print(tmp_path: Path)
         package com.example;
 
         public class A {
+        
+        
+        
+            public int a;
+            
+            public static int b;
+            
             public static int add(int a, int b) {
                 return a + b;
             }
@@ -415,6 +432,144 @@ def test_chunk_delegates_to_chunk_str(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr(chunker, "chunk_str", _fake_chunk_str)
     list(chunker.chunk(path))
     assert called["ok"] is True
+
+
+def test_chunk_sets_path_sha256_language_and_container(tmp_path: Path) -> None:
+    _require_treesitter()
+
+    code = textwrap.dedent(
+        """\
+        class A:
+            def m(self):
+                return 1
+
+        def f():
+            return 2
+        """
+    )
+    path = _write(tmp_path / "meta.py", code)
+    expected_sha = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    # Use a small chunk size to force recursion into the class body,
+    # so we can observe method-level scope.
+    cfg = Config(chunk_size=20, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION)
+    chunks = list(TreeSitterChunker(cfg).chunk(path))
+
+    assert len(chunks) >= 1
+    assert all(c.path == path for c in chunks)
+    assert all(c.sha256 == expected_sha for c in chunks)
+    assert all(c.language == "python" for c in chunks)
+
+    # Boundary-truncated scope_path + contained_scopes for inner (function/method) info
+    assert all(any(s.kind == ScopeKind.FILE and s.name == "meta" for s in c.scope_path) for c in chunks)
+
+    # "A" is a TYPE boundary now (unified across class/interface/enum/record/...).
+    assert any(any(s.kind == ScopeKind.TYPE and s.name == "A" for s in c.scope_path) for c in chunks)
+
+    # With FUNCTION as a boundary kind, functions/methods are expected to appear in scope_path.
+    assert any(
+        "def m" in c.text
+        and any(s.kind == ScopeKind.TYPE and s.name == "A" for s in c.scope_path)
+        and any(s.kind == ScopeKind.FUNCTION and s.name == "m" for s in c.scope_path)
+        for c in chunks
+    )
+
+    # The top-level function f should be a FUNCTION scope without a TYPE parent.
+    assert any(
+        "def f" in c.text
+        and any(s.kind == ScopeKind.FUNCTION and s.name == "f" for s in c.scope_path)
+        and not any(s.kind == ScopeKind.TYPE for s in c.scope_path)
+        for c in chunks
+    )
+
+
+def test_chunk_str_sets_language_but_no_path_or_sha256_when_not_given() -> None:
+    _require_treesitter()
+
+    code = "def add(a, b):\n    return a + b\n"
+    chunks = list(TreeSitterChunker(Config(chunk_size=80, overlap_ratio=0.0)).chunk_str(code, language="python"))
+
+    assert len(chunks) >= 1
+    assert all(c.language == "python" for c in chunks)
+    assert all(c.path is None for c in chunks)
+    assert all(c.sha256 is None for c in chunks)
+
+
+def test_chunk_java_sets_type_and_function_scopes(tmp_path: Path) -> None:
+    _require_treesitter()
+
+    code = textwrap.dedent(
+        """\
+        package com.example;
+
+        public class A {
+            public static int add(int a, int b) {
+                int x = a + b;
+                int y = x + 1;
+                return y;
+            }
+        }
+        """
+    )
+    path = _write(tmp_path / "A.java", code)
+    chunks = list(
+        TreeSitterChunker(Config(chunk_size=40, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION)).chunk(path)
+    )
+
+    assert len(chunks) >= 1
+    assert all(c.language == "java" for c in chunks)
+
+    assert any(any(s.kind == ScopeKind.TYPE and s.name == "A" for s in c.scope_path) for c in chunks)
+    assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "add" for s in c.scope_path) for c in chunks)
+
+
+def test_python_async_function_scope_kind(tmp_path: Path) -> None:
+    _require_treesitter()
+
+    code = """
+async def af():
+    return 1
+""".lstrip("\n")
+    path = _write(tmp_path / "a.py", code)
+
+    chunker = TreeSitterChunker(Config(chunk_size=200, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION))
+    chunks = list(chunker.chunk(path))
+    assert chunks
+
+    assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "af" for s in c.scope_path) for c in chunks)
+
+
+def test_java_constructor_and_type_kinds(tmp_path: Path) -> None:
+    _require_treesitter()
+
+    code = textwrap.dedent(
+        """\
+        package com.example;
+
+        interface I { void x(); }
+        enum E { A, B }
+        record R(int x) {}
+
+        class A {
+          A() { }
+          void m() { }
+        }
+        """
+    )
+    path = _write(tmp_path / "A.java", code)
+
+    chunker = TreeSitterChunker(Config(chunk_size=400, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION))
+    chunks = list(chunker.chunk(path))
+    assert chunks
+
+    # interface/enum/record/class are all TYPE now.
+    assert any(any(s.kind == ScopeKind.TYPE and s.name == "I" for s in c.scope_path) for c in chunks)
+    assert any(any(s.kind == ScopeKind.TYPE and s.name == "E" for s in c.scope_path) for c in chunks)
+    assert any(any(s.kind == ScopeKind.TYPE and s.name == "R" for s in c.scope_path) for c in chunks)
+    assert any(any(s.kind == ScopeKind.TYPE and s.name == "A" for s in c.scope_path) for c in chunks)
+    # constructors/methods are FUNCTION now, and FUNCTION is a boundary kind -> scope_path.
+    assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "A" for s in c.scope_path) for c in chunks)
+    assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "m" for s in c.scope_path) for c in chunks)
 
 
 
