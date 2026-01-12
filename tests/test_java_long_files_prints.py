@@ -107,15 +107,36 @@ def test_java_long_file_boundary_file_print(tmp_path: Path):
         """
     )
     path = _write(tmp_path, "MainApp.java", code)
-
+    print("+++++++++FILE BOUNDARY++++++++\n\n\n\n")
     cfg = Config(
         chunk_size=220,
-        overlap_ratio=0.0,
+        overlap_ratio=0.2,
         boundary=ScopeKind.FILE,
         filetype_map={"java": [r"^java$"]},
     )
     chunks = list(TreeSitterChunker(cfg).chunk(path))
     _print_chunks("java long file (boundary=FILE, chunk_size=220)", chunks)
+
+
+    print("\n\n\n\n+++++++++TYPE BOUNDARY++++++++\n\n\n\n")
+    cfg = Config(
+        chunk_size=220,
+        overlap_ratio=0.2,
+        boundary=ScopeKind.TYPE,
+        filetype_map={"java": [r"^java$"]},
+    )
+    chunks = list(TreeSitterChunker(cfg).chunk(path))
+    _print_chunks("java long file (boundary=TYPE, chunk_size=220)", chunks)
+
+    print("\n\n\n\n+++++++++FUNCTION BOUNDARY++++++++\n\n\n\n")
+    cfg = Config(
+        chunk_size=220,
+        overlap_ratio=0.2,
+        boundary=ScopeKind.FUNCTION,
+        filetype_map={"java": [r"^java$"]},
+    )
+    chunks = list(TreeSitterChunker(cfg).chunk(path))
+    _print_chunks("java long file (boundary=FUNCTION, chunk_size=220)", chunks)
 
     assert chunks
 

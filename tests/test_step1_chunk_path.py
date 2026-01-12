@@ -110,11 +110,12 @@ def test_gap_trim_blank_lines_option_python(tmp_path: Path):
     )
     path = _write(tmp_path / "gap.py", code)
 
-    cfg_no_trim = Config(chunk_size=10_000, overlap_ratio=0.0, trim_gap_blank_lines=False)
+    # Gap trimming is an AST-mode feature (boundary != FILE). Under boundary=FILE we do pure text chunking.
+    cfg_no_trim = Config(chunk_size=10_000, overlap_ratio=0.0, trim_gap_blank_lines=False, boundary=ScopeKind.TYPE)
     chunks_no_trim = list(TreeSitterChunker(cfg_no_trim).chunk(path))
     text_no_trim = "".join(c.text for c in chunks_no_trim)
 
-    cfg_trim = Config(chunk_size=10_000, overlap_ratio=0.0, trim_gap_blank_lines=True)
+    cfg_trim = Config(chunk_size=10_000, overlap_ratio=0.0, trim_gap_blank_lines=True, boundary=ScopeKind.TYPE)
     chunks_trim = list(TreeSitterChunker(cfg_trim).chunk(path))
     text_trim = "".join(c.text for c in chunks_trim)
 
@@ -567,9 +568,10 @@ def test_java_constructor_and_type_kinds(tmp_path: Path) -> None:
     assert any(any(s.kind == ScopeKind.TYPE and s.name == "E" for s in c.scope_path) for c in chunks)
     assert any(any(s.kind == ScopeKind.TYPE and s.name == "R" for s in c.scope_path) for c in chunks)
     assert any(any(s.kind == ScopeKind.TYPE and s.name == "A" for s in c.scope_path) for c in chunks)
-    # constructors/methods are FUNCTION now, and FUNCTION is a boundary kind -> scope_path.
-    assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "A" for s in c.scope_path) for c in chunks)
-    assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "m" for s in c.scope_path) for c in chunks)
+    # With the optimized FUNCTION-boundary behavior, small TYPE nodes may be emitted as a single chunk,
+    # and their inner functions are reported via contained_scopes.
+    assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "A" for s in c.contained_scopes) for c in chunks)
+    assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "m" for s in c.contained_scopes) for c in chunks)
 
 
 
