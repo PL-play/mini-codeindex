@@ -5,7 +5,7 @@ import textwrap
 
 import pytest
 
-from mini_code_index.chunking import Config, ScopeKind, TreeSitterChunker
+from mini_code_index.chunking import Config, ScopeKind, TreeSitterChunker, print_chunks
 
 
 def _require_treesitter() -> None:
@@ -20,32 +20,24 @@ def _write(tmp_path: Path, name: str, content: str) -> str:
     return str(p)
 
 
-def _fmt_scopes(scopes) -> str:
-    return " / ".join(f"{s.kind.value}:{s.name}" for s in scopes) if scopes else "<empty>"
-
-
 def _print_chunks(title: str, chunks) -> None:
-    print(f"\n=== {title} ===")
-    for i, c in enumerate(chunks, 1):
-        start = (c.start.row, c.start.column) if c.start else None
-        end = (c.end.row, c.end.column) if c.end else None
-        preview = " ".join(c.text.strip().split())[:160]
-        print(
-            f"#{i:02d} start={start} end={end} chars={len(c.text)} "
-            f"scope_path={_fmt_scopes(c.scope_path)} contained={_fmt_scopes(c.contained_scopes)}"
-        )
-        print(f"    preview: {preview}")
-        print("    --- full_text ---")
-        print(c.text)
-        print("    --- /full_text ---")
+    print_chunks(title, list(chunks), include_text=True)
 
 
-@pytest.mark.parametrize("boundary", [ScopeKind.FILE, ScopeKind.TYPE, ScopeKind.FUNCTION])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "file",
+        "type",
+        "function",
+        "auto_ast",
+    ],
+)
 @pytest.mark.parametrize("chunk_size", [50, 120, 10_000])
-def test_python_boundaries_and_chunk_size_matrix_print(tmp_path: Path, boundary: ScopeKind, chunk_size: int):
+def test_python_boundaries_and_chunk_size_matrix_print(tmp_path: Path, mode: str, chunk_size: int):
     """
     Print-first matrix test for Python:
-    - different boundary sets (FILE/TYPE/FUNCTION)
+    - different modes (file/type/function/auto_ast)
     - different chunk sizes (tiny/medium/huge)
     """
     _require_treesitter()
@@ -70,13 +62,9 @@ def test_python_boundaries_and_chunk_size_matrix_print(tmp_path: Path, boundary:
     )
     path = _write(tmp_path, "matrix.py", code)
 
-    cfg = Config(
-        chunk_size=chunk_size,
-        overlap_ratio=0.0,
-        boundary=boundary,
-    )
+    cfg = Config(chunk_size=chunk_size, overlap_ratio=0.0, mode=mode)
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks(f"python boundary={boundary.value} chunk_size={chunk_size}", chunks)
+    _print_chunks(f"python mode={mode} chunk_size={chunk_size}", chunks)
 
     # very light sanity so the test is stable
     assert chunks
@@ -85,13 +73,21 @@ def test_python_boundaries_and_chunk_size_matrix_print(tmp_path: Path, boundary:
     assert "def top" in joined
 
 
-@pytest.mark.parametrize("boundary", [ScopeKind.FILE, ScopeKind.TYPE, ScopeKind.FUNCTION])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "file",
+        "type",
+        "function",
+        "auto_ast",
+    ],
+)
 @pytest.mark.parametrize("chunk_size", [60, 140, 10_000])
-def test_java_boundaries_and_chunk_size_matrix_print(tmp_path: Path, boundary: ScopeKind, chunk_size: int):
+def test_java_boundaries_and_chunk_size_matrix_print(tmp_path: Path, mode: str, chunk_size: int):
     """
     Print-first matrix test for Java:
     - package/imports + multiple types + methods + constructor
-    - different boundary sets (FILE/TYPE/FUNCTION)
+    - different modes (file/type/function/auto_ast)
     - different chunk sizes
     """
     _require_treesitter()
@@ -125,11 +121,11 @@ def test_java_boundaries_and_chunk_size_matrix_print(tmp_path: Path, boundary: S
     cfg = Config(
         chunk_size=chunk_size,
         overlap_ratio=0.0,
-        boundary=boundary,
+        mode=mode,
         filetype_map={"java": [r"^java$"]},
     )
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks(f"java boundary={boundary.value} chunk_size={chunk_size}", chunks)
+    _print_chunks(f"java mode={mode} chunk_size={chunk_size}", chunks)
 
     assert chunks
     joined = "".join(c.text for c in chunks)
@@ -139,7 +135,7 @@ def test_java_boundaries_and_chunk_size_matrix_print(tmp_path: Path, boundary: S
 
 def test_boundary_effect_demo_python_print(tmp_path: Path):
     """
-    A single demo showing how boundary changes scope_path/contained_scopes with a small chunk_size.
+    A single demo showing how mode changes scope_path/contained_scopes with a small chunk_size.
     """
     _require_treesitter()
 
@@ -158,18 +154,18 @@ def test_boundary_effect_demo_python_print(tmp_path: Path):
     cfg_type = Config(
         chunk_size=80,
         overlap_ratio=0.0,
-        boundary=ScopeKind.TYPE,
+        mode="type",
     )
     chunks_type = list(TreeSitterChunker(cfg_type).chunk(path))
-    _print_chunks("python boundary demo (FILE+TYPE)", chunks_type)
+    _print_chunks('python mode demo (mode="type")', chunks_type)
 
     cfg_func = Config(
         chunk_size=80,
         overlap_ratio=0.0,
-        boundary=ScopeKind.FUNCTION,
+        mode="function",
     )
     chunks_func = list(TreeSitterChunker(cfg_func).chunk(path))
-    _print_chunks("python boundary demo (FILE+TYPE+FUNCTION)", chunks_func)
+    _print_chunks('python mode demo (mode="function")', chunks_func)
 
     assert chunks_type and chunks_func
 

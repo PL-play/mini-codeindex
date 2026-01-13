@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import re
 from bisect import bisect_left, bisect_right
@@ -6,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import cache
 from io import TextIOWrapper
-from typing import Generator, Optional, Protocol, Union
+from typing import Generator, Optional, Protocol
 
 from pygments.lexer import Lexer
 from pygments.lexers import get_lexer_for_filename
@@ -64,6 +65,8 @@ class ScopeKind(str, Enum):
 class Scope:
     kind: ScopeKind
     name: str
+    # Original tree-sitter node.type that produced this scope (debugging/extension aid).
+    raw_type: Optional[str] = None
 
 
 @dataclass
@@ -89,9 +92,51 @@ class Chunk:
     scope_path: list[Scope] = field(default_factory=list)
 
     # If a chunk contains multiple inner scopes (e.g. class A method m + method n
-    # when boundary is at class), keep scope_path truncated to the configured
-    # boundary prefix and record the distinct inner scopes here.
+    # when mode="type"), keep scope_path truncated to the configured
+    # scope prefix and record the distinct inner scopes here.
     contained_scopes: list[Scope] = field(default_factory=list)
+
+
+def format_scope(scope: Scope) -> str:
+    raw = scope.raw_type if scope.raw_type is not None else "?"
+    return f"{scope.kind.value}:{scope.name}<{raw}>"
+
+
+def format_scopes(scopes: list[Scope]) -> str:
+    if not scopes:
+        return "<empty>"
+    return " / ".join(format_scope(s) for s in scopes)
+
+
+def format_chunk_header(chunk: Chunk, idx: Optional[int] = None) -> str:
+    prefix = f"[{idx:02d}] " if isinstance(idx, int) else ""
+    start = (chunk.start.row, chunk.start.column) if chunk.start else None
+    end = (chunk.end.row, chunk.end.column) if chunk.end else None
+    return (
+        f"{prefix}{start} -> {end}  chars={len(chunk.text)}  "
+        f"scope_path={format_scopes(chunk.scope_path)}  "
+        f"contained={format_scopes(chunk.contained_scopes)}"
+    )
+
+
+def format_chunk(chunk: Chunk, idx: Optional[int] = None, *, include_text: bool = True) -> str:
+    header = format_chunk_header(chunk, idx)
+    if not include_text:
+        return header
+    return "\n".join(
+        [
+            header,
+            "----- chunk text -----",
+            chunk.text,
+            "----- /chunk text -----",
+        ]
+    )
+
+
+def print_chunks(title: str, chunks: list[Chunk], *, include_text: bool = True) -> None:
+    print(f"\n=== {title} ===")
+    for i, c in enumerate(chunks, 1):
+        print(format_chunk(c, i, include_text=include_text))
 
 
 @dataclass
@@ -102,12 +147,12 @@ class Config:
     chunk_filters: dict[str, list[str]] = None  # language -> patterns, "*" for default
     filetype_map: dict[str, list[str]] = None  # language -> [regex over extension]
     trim_gap_blank_lines: bool = True
-    # Boundary controls BOTH:
-    # - how scope_path is truncated (outer containers retained up to the boundary)
-    # - whether chunks are allowed to mix across different scopes at that boundary
-    #
-    # Must be one of: FILE, TYPE, FUNCTION.
-    boundary: Optional[Union[ScopeKind, str]] = None
+    # Chunking strategy:
+    # - "file": pure text chunking at file level (still annotates contained_scopes)
+    # - "type": type container as primary unit
+    # - "function": function/method as primary unit (but small types are emitted whole)
+    # - "auto_ast": legacy "AST window packing" (best-effort structural chunks)
+    mode: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.chunk_filters is None:
@@ -115,16 +160,19 @@ class Config:
         if self.filetype_map is None:
             # Default to a common mapping, while avoiding shared mutable defaults.
             self.filetype_map = {k: v.copy() for k, v in DEFAULT_FILETYPE_MAP.items()}
-        # Normalize/validate boundary; invalid -> default to FILE.
-        try:
-            if self.boundary is None:
-                self.boundary = ScopeKind.FILE
-            elif isinstance(self.boundary, str):
-                self.boundary = ScopeKind(self.boundary)
-        except Exception:
-            self.boundary = ScopeKind.FILE
-        if self.boundary not in {ScopeKind.FILE, ScopeKind.TYPE, ScopeKind.FUNCTION}:
-            self.boundary = ScopeKind.FILE
+        # Normalize/validate mode.
+        allowed_modes = {"file", "type", "function", "auto_ast"}
+
+        if self.mode is None:
+            logging.warning('Config.mode is None; defaulting to "auto_ast"')
+            self.mode = "auto_ast"
+
+        if self.mode not in allowed_modes:
+            logging.warning(
+                f'Unknown Config.mode="{self.mode}"; valid modes={sorted(allowed_modes)}; defaulting to "auto_ast"'
+            )
+            self.mode = "auto_ast"
+
         if not (0 <= self.overlap_ratio < 1):
             raise ValueError("overlap_ratio must be in [0, 1).")
 
@@ -179,7 +227,7 @@ class StringChunker:
             end_pos = i + len(chunk_text)
             # Preserve the legacy end-point convention used by VectorCode's StringChunker:
             # - end.row advances by the number of newlines in the chunk
-            # - if the chunk ends exactly at a line boundary (right after a '\n'),
+            # - if the chunk ends exactly at a line break (right after a '\n'),
             #   end.column is -1 on the next row.
             if end_pos > 0 and end_pos <= len(data) and data[end_pos - 1] == "\n":
                 end_col_in_line = -1
@@ -260,25 +308,40 @@ class TreeSitterChunker:
         lang = language.lower()
         t = getattr(node, "type", None)
 
+        def _decode(n: Optional["Node"]) -> Optional[str]:
+            if n is None:
+                return None
+            try:
+                return text_bytes[n.start_byte : n.end_byte].decode()
+            except Exception:
+                return None
+
         def _name_from_field() -> Optional[str]:
             name_node = node.child_by_field_name("name")  # type: ignore[attr-defined]
             if name_node is None:
                 return None
-            try:
-                return text_bytes[name_node.start_byte : name_node.end_byte].decode()
-            except Exception:
-                return None
+            return _decode(name_node)
+
+        def _name_from_first_identifier() -> Optional[str]:
+            # Best-effort: many grammars use 'identifier' / 'type_identifier' / 'name' tokens.
+            for ch in getattr(node, "children", []):
+                if getattr(ch, "type", None) in {"identifier", "type_identifier", "property_identifier"}:
+                    return _decode(ch)
+            return None
+
+        def _get_name() -> Optional[str]:
+            return _name_from_field() or _name_from_first_identifier()
 
         if lang == "python":
             if t == "class_definition":
-                n = _name_from_field()
-                return Scope(kind=ScopeKind.TYPE, name=n) if n else None
+                n = _get_name()
+                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=str(t)) if n else None
             if t in {"function_definition", "async_function_definition"}:
-                n = _name_from_field()
+                n = _get_name()
                 if not n:
                     return None
-                # Methods are also functions for our boundary purposes.
-                return Scope(kind=ScopeKind.FUNCTION, name=n)
+                # Methods are also functions for our mode="function" purposes.
+                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=str(t))
 
         if lang == "java":
             if t in {
@@ -287,27 +350,49 @@ class TreeSitterChunker:
                 "enum_declaration",
                 "record_declaration",
             }:
-                n = _name_from_field()
-                return Scope(kind=ScopeKind.TYPE, name=n) if n else None
+                n = _get_name()
+                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=str(t)) if n else None
             if t in {"method_declaration", "constructor_declaration"}:
-                n = _name_from_field()
-                return Scope(kind=ScopeKind.FUNCTION, name=n) if n else None
+                n = _get_name()
+                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=str(t)) if n else None
+
+        # Generic fallback for other languages: conservative heuristics based on node.type names.
+        # This intentionally only covers common declaration nodes to avoid false positives.
+        if isinstance(t, str):
+            tl = t.lower()
+
+            type_markers = ("class", "interface", "enum", "record", "struct", "trait", "protocol")
+            func_markers = ("function", "method", "constructor")
+
+            is_type = any(m in tl for m in type_markers) and (
+                "declaration" in tl or "definition" in tl or "specifier" in tl or tl in type_markers
+            )
+            is_func = any(m in tl for m in func_markers) and (
+                "declaration" in tl or "definition" in tl or "item" in tl or tl in func_markers
+            )
+
+            if is_type:
+                n = _get_name()
+                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=t) if n else None
+            if is_func:
+                n = _get_name()
+                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=t) if n else None
 
         return None
 
     def _boundary_prefix(self, scope_path: list[Scope]) -> list[Scope]:
-        """Return the scope prefix up to the configured boundary.
+        """Return the scope prefix up to the configured mode.
 
         Ordering is conceptually: FILE -> TYPE -> FUNCTION.
         For example:
-        - boundary=FILE keeps only FILE (if present)
-        - boundary=TYPE keeps FILE/TYPE up to TYPE (if present), else falls back to FILE
-        - boundary=FUNCTION keeps FILE/TYPE/FUNCTION up to FUNCTION (if present), else falls back to TYPE/FILE
+        - mode="file" keeps only FILE (if present)
+        - mode="type" keeps FILE/TYPE up to TYPE (if present), else falls back to FILE
+        - mode="function" keeps FILE/TYPE/FUNCTION up to FUNCTION (if present), else falls back to TYPE/FILE
         """
-        b = self.config.boundary
-        if b == ScopeKind.FILE:
+        m = self.config.mode
+        if m == "file" or m == "auto_ast":
             allowed = {ScopeKind.FILE}
-        elif b == ScopeKind.TYPE:
+        elif m == "type":
             allowed = {ScopeKind.FILE, ScopeKind.TYPE}
         else:  # FUNCTION
             allowed = {ScopeKind.FILE, ScopeKind.TYPE, ScopeKind.FUNCTION}
@@ -318,14 +403,14 @@ class TreeSitterChunker:
                 last_idx = i
         if last_idx < 0:
             return []
-        # If our boundary kind wasn't present, fall back to the innermost available allowed scope.
-        # This makes boundary=FUNCTION still produce FILE-only prefixes for top-level statements.
+        # If our target kind wasn't present, fall back to the innermost available allowed scope.
+        # This makes mode="function" still produce FILE-only prefixes for top-level statements.
         return scope_path[: last_idx + 1]
 
     def _inner_scopes_for_chunk(self, *, full_scope_path: list[Scope], boundary_prefix: list[Scope]) -> list[Scope]:
-        """Return a best-effort list of inner scopes beyond the boundary prefix.
+        """Return a best-effort list of inner scopes beyond the scope prefix.
 
-        We record the first scope immediately under the boundary (e.g., method/function),
+        We record the first scope immediately under the prefix (e.g., method/function),
         which is typically what callers care about when a chunk mixes siblings.
         """
 
@@ -485,7 +570,7 @@ class TreeSitterChunker:
                 child, language=language, text_bytes=text_bytes, scope_stack=scope_stack
             )
 
-            # boundary=FUNCTION: if a TYPE node is small enough, emit it as ONE chunk.
+            # mode="function": if a TYPE node is small enough, emit it as ONE chunk.
             # This avoids fragmentation like:
             #   interface I {  (chunk)
             #   {              (chunk)
@@ -495,7 +580,7 @@ class TreeSitterChunker:
             if (
                 child_scope is not None
                 and child_scope.kind == ScopeKind.TYPE
-                and self.config.boundary == ScopeKind.FUNCTION
+                and self.config.mode == "function"
                 and getattr(child, "text", None) is not None
                 and (self.config.chunk_size < 0 or len(child.text.decode()) <= self.config.chunk_size)  # type: ignore[attr-defined]
             ):
@@ -545,8 +630,8 @@ class TreeSitterChunker:
                 prev_node = child
                 continue
 
-            # boundary=TYPE: emit each TYPE node as a whole chunk (or string-chunked if too large).
-            if child_scope is not None and child_scope.kind == ScopeKind.TYPE and self.config.boundary == ScopeKind.TYPE:
+            # mode="type": emit each TYPE node as a whole chunk (or string-chunked if too large).
+            if child_scope is not None and child_scope.kind == ScopeKind.TYPE and self.config.mode == "type":
                 if current_chunk:
                     assert current_start is not None
                     assert current_end is not None
@@ -574,17 +659,17 @@ class TreeSitterChunker:
                 prev_node = child
                 continue
 
-            # Boundary-driven recursion:
-            # - boundary=FILE: do NOT recurse solely because we saw a scope node; allow mixing.
-            # - boundary=TYPE: recurse into TYPE nodes so each type is chunked independently.
-            # - boundary=FUNCTION: recurse into TYPE and FUNCTION nodes so each function/method is chunked independently.
+            # Mode-driven recursion:
+            # - mode="file": do NOT recurse solely because we saw a scope node; allow mixing.
+            # - mode="type": recurse into TYPE nodes so each type is chunked independently.
+            # - mode="function": recurse into TYPE nodes (when large) to discover functions; functions are emitted as units.
             should_recurse_for_boundary = False
             if child_scope is not None:
-                if child_scope.kind == ScopeKind.TYPE and self.config.boundary == ScopeKind.FUNCTION:
-                    # For FUNCTION boundary we traverse into TYPE containers to discover functions.
+                if child_scope.kind == ScopeKind.TYPE and self.config.mode == "function":
+                    # For mode="function" we traverse into TYPE containers to discover functions.
                     should_recurse_for_boundary = True
-                if child_scope.kind == ScopeKind.FUNCTION and self.config.boundary == ScopeKind.FUNCTION:
-                    # boundary=FUNCTION: emit each FUNCTION node as a whole chunk (or string-chunked if too large),
+                if child_scope.kind == ScopeKind.FUNCTION and self.config.mode == "function":
+                    # mode="function": emit each FUNCTION node as a whole chunk (or string-chunked if too large),
                     # and do NOT recurse into it.
                     if current_chunk:
                         assert current_start is not None
@@ -634,37 +719,56 @@ class TreeSitterChunker:
                 prev_node = child
                 continue
 
-            # Recurse into structural container nodes that may contain scoped declarations.
-            if language is not None:
-                # Only recurse into containers when boundary is at least TYPE.
-                if self.config.boundary != ScopeKind.FILE:
-                    lang_lower = language.lower()
-                    java_containers = {"class_body", "interface_body", "enum_body", "record_body"}
-                    python_containers = {"block"}
-                    if (lang_lower == "java" and child_type in java_containers) or (
-                        lang_lower == "python" and child_type in python_containers
-                    ):
-                        if current_chunk:
-                            assert current_start is not None
-                            assert current_end is not None
-                            yield Chunk(
-                                text=current_chunk,
-                                start=current_start,
-                                end=current_end,
-                                scope_path=current_scope_path,
-                                contained_scopes=current_contained,
-                            )
-                            current_chunk = ""
-                            current_start = None
-                            current_end = None
-                            current_scope_path = []
-                            current_contained = []
-
-                        yield from self._chunk_node(
-                            child, text_bytes, language=language, scope_stack=scope_stack
+            # Recurse into structural container nodes that may contain scoped declarations
+            # (class bodies, blocks, declaration lists, etc.).
+            #
+            # This is intentionally language-agnostic: many grammars put method/function
+            # declarations under nodes like "class_body" or "block", and without this
+            # recursion mode="function" can't discover/emits inner FUNCTION nodes.
+            if self.config.mode in {"type", "function"} and isinstance(child_type, str):
+                ct = child_type.lower()
+                common_containers = {
+                    "block",
+                    "body",
+                    "class_body",
+                    "interface_body",
+                    "enum_body",
+                    "record_body",
+                    "declaration_list",
+                    "statement_block",
+                    "compound_statement",
+                    "module",
+                    "program",
+                    "source_file",
+                    "translation_unit",
+                }
+                is_container = (
+                    ct in common_containers
+                    or ct.endswith("_body")
+                    or ct.endswith("_block")
+                    or ct.endswith("_list")
+                    or "declaration_list" in ct
+                )
+                if is_container:
+                    if current_chunk:
+                        assert current_start is not None
+                        assert current_end is not None
+                        yield Chunk(
+                            text=current_chunk,
+                            start=current_start,
+                            end=current_end,
+                            scope_path=current_scope_path,
+                            contained_scopes=current_contained,
                         )
-                        prev_node = child
-                        continue
+                        current_chunk = ""
+                        current_start = None
+                        current_end = None
+                        current_scope_path = []
+                        current_contained = []
+
+                    yield from self._chunk_node(child, text_bytes, language=language, scope_stack=scope_stack)
+                    prev_node = child
+                    continue
 
             if self.config.chunk_size >= 0 and len(child_text) > self.config.chunk_size:
                 if current_chunk:
@@ -718,7 +822,7 @@ class TreeSitterChunker:
             if self.config.chunk_size < 0 or (
                 len(current_chunk) + len(gap_text) + len(child_text) <= self.config.chunk_size
             ):
-                # If the next child is under a different *boundary*, flush first.
+                # If the next child is under a different *scope prefix*, flush first.
                 if current_scope_path != child_boundary and current_chunk:
                     assert current_start is not None
                     assert current_end is not None
@@ -747,7 +851,7 @@ class TreeSitterChunker:
                     prev_node = child
                     continue
 
-                # Same boundary: allow mixing. Record inner scope(s).
+                # Same prefix: allow mixing. Record inner scope(s).
                 for s in child_inner:
                     if (s.kind, s.name) not in {(x.kind, x.name) for x in current_contained}:
                         current_contained.append(s)
@@ -790,6 +894,163 @@ class TreeSitterChunker:
                 scope_path=current_scope_path,
                 contained_scopes=current_contained,
             )
+
+    def _chunk_node_auto_ast(
+        self,
+        node: "Node",
+        text_bytes: bytes,
+        *,
+        language: Optional[str],
+        scope_stack: list[Scope],
+    ) -> Generator[Chunk, None, None]:
+        """
+        Legacy / baseline chunker: pack sibling AST nodes into chunks up to chunk_size.
+
+        Compared to mode-driven strategies:
+        - It does NOT try to make TYPE/FUNCTION the primary unit.
+        - It tries to preserve syntactic locality by concatenating adjacent AST children.
+        - It still attaches scope_path (FILE container) and contained_scopes (TYPE/FUNCTION encountered).
+        """
+
+        # Track the current output chunk (text + span + contained scopes).
+        current_text = ""
+        current_start: "Point | None" = None
+        current_end: "Point | None" = None
+        current_contained: list[Scope] = []
+        prev_node: "Node | None" = None
+
+        # Extend scope_stack if this node is itself a scope.
+        local_scope = self._scope_of_node(
+            node, language=language, text_bytes=text_bytes, scope_stack=scope_stack
+        )
+        if local_scope is not None:
+            scope_stack = [*scope_stack, local_scope]
+
+        file_scope_path = [s for s in scope_stack if s.kind == ScopeKind.FILE]
+
+        def _add_contained(scopes: list[Scope]) -> None:
+            for sc in scopes:
+                if sc.kind not in {ScopeKind.TYPE, ScopeKind.FUNCTION}:
+                    continue
+                if (sc.kind, sc.name) not in {(x.kind, x.name) for x in current_contained}:
+                    current_contained.append(sc)
+
+        def _normalize_gap_text(gap: str) -> str:
+            if not self.config.trim_gap_blank_lines:
+                return gap
+            if not gap:
+                return ""
+            lines = gap.splitlines(keepends=True)
+            kept = [ln for ln in lines if ln.strip() != ""]
+            if kept:
+                return "".join(kept)
+            if "\n" in gap:
+                return "\n"
+            return " "
+
+        def _collect_scopes_in_subtree(n: "Node", stack: list[Scope]) -> list[Scope]:
+            found: list[Scope] = []
+
+            def _dfs(x: "Node", st: list[Scope]) -> None:
+                sc = self._scope_of_node(
+                    x, language=language, text_bytes=text_bytes, scope_stack=st
+                )
+                if sc is not None:
+                    if sc.kind in {ScopeKind.TYPE, ScopeKind.FUNCTION} and (sc.kind, sc.name) not in {
+                        (y.kind, y.name) for y in found
+                    }:
+                        found.append(sc)
+                    st = [*st, sc]
+                for ch in getattr(x, "children", []):
+                    _dfs(ch, st)
+
+            _dfs(n, stack)
+            return found
+
+        def _flush() -> Generator[Chunk, None, None]:
+            nonlocal current_text, current_start, current_end, current_contained
+            if not current_text:
+                return
+            assert current_start is not None
+            assert current_end is not None
+            yield Chunk(
+                text=current_text,
+                start=current_start,
+                end=current_end,
+                scope_path=file_scope_path,
+                contained_scopes=current_contained,
+            )
+            current_text = ""
+            current_start = None
+            current_end = None
+            current_contained = []
+
+        # Leaf node: fall back to string chunking within this node, but still attach scopes.
+        if len(getattr(node, "children", [])) == 0 and getattr(node, "text", None):
+            sp = node.start_point
+            start_pos = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+            ep = node.end_point
+            base_contained = _collect_scopes_in_subtree(node, scope_stack)
+            for c in self._fallback.chunk(node.text.decode(), start_pos=start_pos):  # type: ignore[attr-defined]
+                yield Chunk(
+                    text=c.text,
+                    start=c.start,
+                    end=c.end,
+                    scope_path=file_scope_path,
+                    contained_scopes=base_contained,
+                )
+            return
+
+        for child in getattr(node, "children", []):
+            child_bytes = text_bytes[child.start_byte : child.end_byte]
+            child_text = child_bytes.decode()
+
+            # If a single child is too large, flush current and recurse into that child.
+            if self.config.chunk_size >= 0 and len(child_text) > self.config.chunk_size:
+                yield from _flush()
+                yield from self._chunk_node_auto_ast(
+                    child, text_bytes, language=language, scope_stack=scope_stack
+                )
+                prev_node = child
+                continue
+
+            # Include exact inter-node gap (optionally normalized).
+            gap_text = ""
+            if prev_node is not None:
+                gap_bytes = text_bytes[prev_node.end_byte : child.start_byte]
+                gap_text = _normalize_gap_text(gap_bytes.decode())
+
+            candidate = (current_text + gap_text + child_text) if current_text else child_text
+
+            if not current_text:
+                sp = child.start_point
+                ep = child.end_point
+                current_text = child_text
+                current_start = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+                current_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
+                current_contained = _collect_scopes_in_subtree(child, scope_stack)
+                prev_node = child
+                continue
+
+            if self.config.chunk_size < 0 or len(candidate) <= self.config.chunk_size:
+                current_text = candidate
+                ep = child.end_point
+                current_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
+                _add_contained(_collect_scopes_in_subtree(child, scope_stack))
+                prev_node = child
+                continue
+
+            # Doesn't fit -> flush and start new chunk with this child.
+            yield from _flush()
+            sp = child.start_point
+            ep = child.end_point
+            current_text = child_text
+            current_start = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+            current_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
+            current_contained = _collect_scopes_in_subtree(child, scope_stack)
+            prev_node = child
+
+        yield from _flush()
 
     def chunk_str(
         self,
@@ -848,7 +1109,7 @@ class TreeSitterChunker:
                 sha256=sha256_value,
                 language=lang,
                 scope_path=[
-                    *( [Scope(kind=ScopeKind.FILE, name=module_value)] if module_value else [] ),
+                    *( [Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file")] if module_value else [] ),
                 ],
                 contained_scopes=[],
             )
@@ -872,7 +1133,7 @@ class TreeSitterChunker:
                     sha256=sha256_value,
                     language=lang,
                     scope_path=[
-                        *( [Scope(kind=ScopeKind.FILE, name=module_value)] if module_value else [] ),
+                        *( [Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file")] if module_value else [] ),
                     ],
                     contained_scopes=[],
                 )
@@ -880,13 +1141,13 @@ class TreeSitterChunker:
 
         pattern_str = self._build_filter_pattern(lang)
 
-        # boundary=FILE => pure text chunking.
+        # mode=file => pure text chunking.
         #
         # Requirements:
         # - do NOT scope-split the file
         # - chunk_filters should not delete useful code (line-level masking instead)
         # - each chunk still needs contained_scopes (TYPE/FUNCTION) at good precision
-        if self.config.boundary == ScopeKind.FILE:
+        if self.config.mode == "file":
             tree = parser.parse(content_bytes)
 
             # (1) Prepare line-level masking regex list
@@ -965,10 +1226,50 @@ class TreeSitterChunker:
                     sha256=sha256_value,
                     language=lang,
                     scope_path=[
-                        *( [Scope(kind=ScopeKind.FILE, name=module_value)] if module_value else [] ),
+                        *( [Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file")] if module_value else [] ),
                     ],
                     contained_scopes=contained,
                 )
+            return
+
+        # mode=auto_ast => legacy AST packing strategy (similar to early prototype).
+        if self.config.mode == "auto_ast":
+            pattern_str = self._build_filter_pattern(lang)
+            tree = parser.parse(content_bytes)
+
+            base_scopes: list[Scope] = []
+            if module_value:
+                base_scopes.append(Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file"))
+
+            chunks = self._chunk_node_auto_ast(
+                tree.root_node, content_bytes, language=lang, scope_stack=base_scopes
+            )
+            if pattern_str:
+                rx = re.compile(pattern_str)
+                for c in chunks:
+                    if rx.match(c.text) is None:
+                        yield Chunk(
+                            text=c.text,
+                            start=c.start,
+                            end=c.end,
+                            path=path,
+                            sha256=sha256_value,
+                            language=lang,
+                            scope_path=c.scope_path,
+                            contained_scopes=c.contained_scopes,
+                        )
+            else:
+                for c in chunks:
+                    yield Chunk(
+                        text=c.text,
+                        start=c.start,
+                        end=c.end,
+                        path=path,
+                        sha256=sha256_value,
+                        language=lang,
+                        scope_path=c.scope_path,
+                        contained_scopes=c.contained_scopes,
+                    )
             return
 
         tree = parser.parse(content_bytes)
@@ -976,7 +1277,7 @@ class TreeSitterChunker:
         base_scopes: list[Scope] = []
         if module_value:
             # Keep name as file-stem for stability across extensions.
-            base_scopes.append(Scope(kind=ScopeKind.FILE, name=module_value))
+            base_scopes.append(Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file"))
 
         chunks = self._chunk_node(tree.root_node, content_bytes, language=lang, scope_stack=base_scopes)
 

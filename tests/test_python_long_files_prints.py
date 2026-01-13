@@ -5,7 +5,7 @@ import textwrap
 
 import pytest
 
-from mini_code_index.chunking import Config, ScopeKind, TreeSitterChunker
+from mini_code_index.chunking import Config, ScopeKind, TreeSitterChunker, print_chunks
 
 
 def _require_treesitter() -> None:
@@ -20,28 +20,13 @@ def _write(tmp_path: Path, name: str, content: str) -> str:
     return str(p)
 
 
-def _fmt_scopes(scopes) -> str:
-    return " / ".join(f"{s.kind.value}:{s.name}" for s in scopes) if scopes else "<empty>"
-
-
-def _print_chunks(title: str, chunks) -> None:
-    print(f"\n=== {title} ===")
-    for i, c in enumerate(chunks, 1):
-        start = (c.start.row, c.start.column) if c.start else None
-        end = (c.end.row, c.end.column) if c.end else None
-        print(
-            f"#{i:02d} start={start} end={end} chars={len(c.text)} "
-            f"scope_path={_fmt_scopes(c.scope_path)} contained={_fmt_scopes(c.contained_scopes)}"
-        )
-        print("----- chunk text -----")
-        print(c.text)
-        print("----- /chunk text -----")
+_print_chunks = print_chunks
 
 
 def test_python_long_file_boundary_file_print(tmp_path: Path):
     """
     Similar to the Java long-file test, but for Python.
-    boundary=FILE => pure text chunking by chunk_size/overlap, while contained_scopes
+    mode="file" => pure text chunking by chunk_size/overlap, while contained_scopes
     still reports TYPE/FUNCTION overlapping each chunk.
     """
     _require_treesitter()
@@ -90,26 +75,31 @@ def test_python_long_file_boundary_file_print(tmp_path: Path):
     )
     path = _write(tmp_path, "big.py", code)
 
-    print("\n\n\n\n+++++++++FILE BOUNDARY++++++++\n\n\n\n")
-    cfg = Config(chunk_size=220, overlap_ratio=0.0, boundary=ScopeKind.FILE)
+    print("\n\n\n\n+++++++++FILE MODE++++++++\n\n\n\n")
+    cfg = Config(chunk_size=220, overlap_ratio=0.0, mode="file")
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("python long file (boundary=FILE, chunk_size=220)", chunks)
+    _print_chunks('python long file (mode="file", chunk_size=220)', chunks)
 
-    print("\n\n\n\n+++++++++TYPE BOUNDARY++++++++\n\n\n\n")
-    cfg = Config(chunk_size=220, overlap_ratio=0.0, boundary=ScopeKind.TYPE)
+    print("\n\n\n\n+++++++++TYPE MODE++++++++\n\n\n\n")
+    cfg = Config(chunk_size=220, overlap_ratio=0.0, mode="type")
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("python long file (boundary=TYPE, chunk_size=220)", chunks)
+    _print_chunks('python long file (mode="type", chunk_size=220)', chunks)
 
-    print("\n\n\n\n+++++++++FUNCTION BOUNDARY++++++++\n\n\n\n")
-    cfg = Config(chunk_size=220, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION)
+    print("\n\n\n\n+++++++++FUNCTION MODE++++++++\n\n\n\n")
+    cfg = Config(chunk_size=220, overlap_ratio=0.0, mode="function")
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("python long file (boundary=FUNCTION, chunk_size=220)", chunks)
+    _print_chunks('python long file (mode="function", chunk_size=220)', chunks)
+
+    print("\n\n\n\n+++++++++AUTO_AST MODE++++++++\n\n\n\n")
+    cfg = Config(chunk_size=220, overlap_ratio=0.0, mode="auto_ast")
+    chunks = list(TreeSitterChunker(cfg).chunk(path))
+    _print_chunks("python long file (mode=auto_ast, chunk_size=220)", chunks)
     assert chunks
 
 
 def test_python_long_file_boundary_type_print(tmp_path: Path):
     """
-    boundary=TYPE => each class is emitted as one chunk if it fits, else split by size/overlap.
+    mode="type" => each class is emitted as one chunk if it fits, else split by size/overlap.
     top-level functions remain as plain text chunks.
     """
     _require_treesitter()
@@ -132,15 +122,15 @@ def test_python_long_file_boundary_type_print(tmp_path: Path):
     )
     path = _write(tmp_path, "types.py", code)
 
-    cfg = Config(chunk_size=120, overlap_ratio=0.0, boundary=ScopeKind.TYPE)
+    cfg = Config(chunk_size=120, overlap_ratio=0.0, mode="type")
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("python (boundary=TYPE, chunk_size=120)", chunks)
+    _print_chunks('python (mode="type", chunk_size=120)', chunks)
     assert chunks
 
 
 def test_python_two_files_boundary_function_print(tmp_path: Path):
     """
-    boundary=FUNCTION => functions/methods are the main unit:
+    mode="function" => functions/methods are the main unit:
     - small TYPE blocks may be emitted as a single chunk with contained_scopes listing methods
     - large functions are split by size/overlap
     """
@@ -173,21 +163,21 @@ def test_python_two_files_boundary_function_print(tmp_path: Path):
     path_a = _write(tmp_path, "a.py", code_a)
     path_b = _write(tmp_path, "b.py", code_b)
 
-    cfg = Config(chunk_size=80, overlap_ratio=0.2, boundary=ScopeKind.FUNCTION)
+    cfg = Config(chunk_size=80, overlap_ratio=0.2, mode="function")
     chunker = TreeSitterChunker(cfg)
 
     chunks_a = list(chunker.chunk(path_a))
-    _print_chunks("python file1 a.py (boundary=FUNCTION, chunk_size=80, overlap=0.2)", chunks_a)
+    _print_chunks('python file1 a.py (mode="function", chunk_size=80, overlap=0.2)', chunks_a)
 
     chunks_b = list(chunker.chunk(path_b))
-    _print_chunks("python file2 b.py (boundary=FUNCTION, chunk_size=80, overlap=0.2)", chunks_b)
+    _print_chunks('python file2 b.py (mode="function", chunk_size=80, overlap=0.2)', chunks_b)
 
     assert chunks_a and chunks_b
 
 
 def test_python_chunk_filters_file_boundary_masks_lines_print(tmp_path: Path):
     """
-    Demonstrate FILE-boundary line masking for chunk_filters:
+    Demonstrate mode="file" line masking for chunk_filters:
     - lines that match (after lstrip) are replaced with spaces, preserving positions
     - useful code in the same chunk remains visible
     """
@@ -207,11 +197,11 @@ def test_python_chunk_filters_file_boundary_masks_lines_print(tmp_path: Path):
     cfg = Config(
         chunk_size=25,
         overlap_ratio=0.0,
-        boundary=ScopeKind.FILE,
+        mode="file",
         chunk_filters={"python": [r"import"]},
     )
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("python FILE-boundary filter masking (chunk_size=25, filter=import)", chunks)
+    _print_chunks('python mode="file" filter masking (chunk_size=25, filter=import)', chunks)
     assert chunks
 
 

@@ -5,7 +5,7 @@ import textwrap
 
 import pytest
 
-from mini_code_index.chunking import Config, ScopeKind, TreeSitterChunker
+from mini_code_index.chunking import Config, ScopeKind, TreeSitterChunker, print_chunks
 
 
 def _require_treesitter() -> None:
@@ -20,27 +20,12 @@ def _write(tmp_path: Path, name: str, content: str) -> str:
     return str(p)
 
 
-def _fmt_scopes(scopes) -> str:
-    return " / ".join(f"{s.kind.value}:{s.name}" for s in scopes) if scopes else "<empty>"
-
-
-def _print_chunks(title: str, chunks) -> None:
-    print(f"\n=== {title} ===")
-    for i, c in enumerate(chunks, 1):
-        start = (c.start.row, c.start.column) if c.start else None
-        end = (c.end.row, c.end.column) if c.end else None
-        print(
-            f"#{i:02d} start={start} end={end} chars={len(c.text)} "
-            f"scope_path={_fmt_scopes(c.scope_path)} contained={_fmt_scopes(c.contained_scopes)}"
-        )
-        print("----- chunk text -----")
-        print(c.text)
-        print("----- /chunk text -----")
+_print_chunks = print_chunks
 
 
 def test_java_long_file_boundary_file_print(tmp_path: Path):
     """
-    Single long Java file, boundary=FILE (coarsest).
+    Single long Java file, mode="file" (coarsest).
     Expectation: chunks may mix multiple types/methods, only constrained by chunk_size.
     """
     _require_treesitter()
@@ -107,43 +92,53 @@ def test_java_long_file_boundary_file_print(tmp_path: Path):
         """
     )
     path = _write(tmp_path, "MainApp.java", code)
-    print("+++++++++FILE BOUNDARY++++++++\n\n\n\n")
+    print("+++++++++FILE MODE++++++++\n\n\n\n")
     cfg = Config(
         chunk_size=220,
         overlap_ratio=0.2,
-        boundary=ScopeKind.FILE,
+        mode="file",
         filetype_map={"java": [r"^java$"]},
     )
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("java long file (boundary=FILE, chunk_size=220)", chunks)
+    _print_chunks('java long file (mode="file", chunk_size=220)', chunks)
 
 
-    print("\n\n\n\n+++++++++TYPE BOUNDARY++++++++\n\n\n\n")
+    print("\n\n\n\n+++++++++TYPE MODE++++++++\n\n\n\n")
     cfg = Config(
         chunk_size=220,
         overlap_ratio=0.2,
-        boundary=ScopeKind.TYPE,
+        mode="type",
         filetype_map={"java": [r"^java$"]},
     )
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("java long file (boundary=TYPE, chunk_size=220)", chunks)
+    _print_chunks('java long file (mode="type", chunk_size=220)', chunks)
 
-    print("\n\n\n\n+++++++++FUNCTION BOUNDARY++++++++\n\n\n\n")
+    print("\n\n\n\n+++++++++FUNCTION MODE++++++++\n\n\n\n")
     cfg = Config(
         chunk_size=220,
         overlap_ratio=0.2,
-        boundary=ScopeKind.FUNCTION,
+        mode="function",
         filetype_map={"java": [r"^java$"]},
     )
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("java long file (boundary=FUNCTION, chunk_size=220)", chunks)
+    _print_chunks('java long file (mode="function", chunk_size=220)', chunks)
+
+    print("\n\n\n\n+++++++++AUTO MODE++++++++\n\n\n\n")
+    cfg = Config(
+        chunk_size=220,
+        overlap_ratio=0.2,
+        mode="auto_ast",
+        filetype_map={"java": [r"^java$"]},
+    )
+    chunks = list(TreeSitterChunker(cfg).chunk(path))
+    _print_chunks('java long file (mode="auto_ast", chunk_size=220)', chunks)
 
     assert chunks
 
 
 def test_java_long_file_boundary_type_print(tmp_path: Path):
     """
-    Same long file, boundary=TYPE.
+    Same long file, mode="type".
     Expectation: top-level TYPE declarations won't be mixed into the same chunk.
     """
     _require_treesitter()
@@ -174,11 +169,11 @@ def test_java_long_file_boundary_type_print(tmp_path: Path):
     cfg = Config(
         chunk_size=120,
         overlap_ratio=0.0,
-        boundary=ScopeKind.TYPE,
+        mode="type",
         filetype_map={"java": [r"^java$"]},
     )
     chunks = list(TreeSitterChunker(cfg).chunk(path))
-    _print_chunks("java long file (boundary=TYPE, chunk_size=120)", chunks)
+    _print_chunks('java long file (mode="type", chunk_size=120)', chunks)
 
     assert chunks
     joined = "".join(c.text for c in chunks)
@@ -187,7 +182,7 @@ def test_java_long_file_boundary_type_print(tmp_path: Path):
 
 def test_java_two_files_boundary_function_print(tmp_path: Path):
     """
-    Two separate Java files, boundary=FUNCTION (finest).
+    Two separate Java files, mode="function" (finest).
     Expectation: each method/constructor will tend to form its own chunk(s) under small chunk_size.
     """
     _require_treesitter()
@@ -235,16 +230,16 @@ def test_java_two_files_boundary_function_print(tmp_path: Path):
     cfg = Config(
         chunk_size=80,
         overlap_ratio=0.0,
-        boundary=ScopeKind.FUNCTION,
+        mode="function",
         filetype_map={"java": [r"^java$"]},
     )
     chunker = TreeSitterChunker(cfg)
 
     chunks_a = list(chunker.chunk(path_a))
-    _print_chunks("java file1 MathUtil.java (boundary=FUNCTION, chunk_size=80)", chunks_a)
+    _print_chunks('java file1 MathUtil.java (mode="function", chunk_size=80)', chunks_a)
 
     chunks_b = list(chunker.chunk(path_b))
-    _print_chunks("java file2 App.java (boundary=FUNCTION, chunk_size=80)", chunks_b)
+    _print_chunks('java file2 App.java (mode="function", chunk_size=80)', chunks_b)
 
     assert chunks_a and chunks_b
 
@@ -282,7 +277,7 @@ def test_java_many_blank_lines_gap_trim_effect_print(tmp_path: Path):
     cfg_no_trim = Config(
         chunk_size=200,
         overlap_ratio=0.0,
-        boundary=ScopeKind.FUNCTION,
+        mode="function",
         trim_gap_blank_lines=False,
         filetype_map={"java": [r"^java$"]},
     )
@@ -292,7 +287,7 @@ def test_java_many_blank_lines_gap_trim_effect_print(tmp_path: Path):
     cfg_trim = Config(
         chunk_size=200,
         overlap_ratio=0.0,
-        boundary=ScopeKind.FUNCTION,
+        mode="function",
         trim_gap_blank_lines=True,
         filetype_map={"java": [r"^java$"]},
     )

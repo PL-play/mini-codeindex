@@ -92,7 +92,7 @@ def test_config_overlap_ratio_validation():
 
 def test_default_scope_boundaries_are_file_type_function():
     cfg = Config()
-    assert cfg.boundary == ScopeKind.FILE
+    assert cfg.mode == "auto_ast"
 
 
 def test_gap_trim_blank_lines_option_python(tmp_path: Path):
@@ -110,12 +110,12 @@ def test_gap_trim_blank_lines_option_python(tmp_path: Path):
     )
     path = _write(tmp_path / "gap.py", code)
 
-    # Gap trimming is an AST-mode feature (boundary != FILE). Under boundary=FILE we do pure text chunking.
-    cfg_no_trim = Config(chunk_size=10_000, overlap_ratio=0.0, trim_gap_blank_lines=False, boundary=ScopeKind.TYPE)
+    # Gap trimming is an AST-mode feature (mode != "file"). Under mode="file" we do pure text chunking.
+    cfg_no_trim = Config(chunk_size=10_000, overlap_ratio=0.0, trim_gap_blank_lines=False, mode="type")
     chunks_no_trim = list(TreeSitterChunker(cfg_no_trim).chunk(path))
     text_no_trim = "".join(c.text for c in chunks_no_trim)
 
-    cfg_trim = Config(chunk_size=10_000, overlap_ratio=0.0, trim_gap_blank_lines=True, boundary=ScopeKind.TYPE)
+    cfg_trim = Config(chunk_size=10_000, overlap_ratio=0.0, trim_gap_blank_lines=True, mode="type")
     chunks_trim = list(TreeSitterChunker(cfg_trim).chunk(path))
     text_trim = "".join(c.text for c in chunks_trim)
 
@@ -453,7 +453,7 @@ def test_chunk_sets_path_sha256_language_and_container(tmp_path: Path) -> None:
 
     # Use a small chunk size to force recursion into the class body,
     # so we can observe method-level scope.
-    cfg = Config(chunk_size=20, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION)
+    cfg = Config(chunk_size=20, overlap_ratio=0.0, mode="function")
     chunks = list(TreeSitterChunker(cfg).chunk(path))
 
     assert len(chunks) >= 1
@@ -464,10 +464,10 @@ def test_chunk_sets_path_sha256_language_and_container(tmp_path: Path) -> None:
     # Boundary-truncated scope_path + contained_scopes for inner (function/method) info
     assert all(any(s.kind == ScopeKind.FILE and s.name == "meta" for s in c.scope_path) for c in chunks)
 
-    # "A" is a TYPE boundary now (unified across class/interface/enum/record/...).
+    # "A" is a TYPE scope now (unified across class/interface/enum/record/...).
     assert any(any(s.kind == ScopeKind.TYPE and s.name == "A" for s in c.scope_path) for c in chunks)
 
-    # With FUNCTION as a boundary kind, functions/methods are expected to appear in scope_path.
+    # With mode="function", functions/methods are expected to appear in scope_path.
     assert any(
         "def m" in c.text
         and any(s.kind == ScopeKind.TYPE and s.name == "A" for s in c.scope_path)
@@ -514,7 +514,7 @@ def test_chunk_java_sets_type_and_function_scopes(tmp_path: Path) -> None:
     )
     path = _write(tmp_path / "A.java", code)
     chunks = list(
-        TreeSitterChunker(Config(chunk_size=40, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION)).chunk(path)
+        TreeSitterChunker(Config(chunk_size=40, overlap_ratio=0.0, mode="function")).chunk(path)
     )
 
     assert len(chunks) >= 1
@@ -533,7 +533,7 @@ async def af():
 """.lstrip("\n")
     path = _write(tmp_path / "a.py", code)
 
-    chunker = TreeSitterChunker(Config(chunk_size=200, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION))
+    chunker = TreeSitterChunker(Config(chunk_size=200, overlap_ratio=0.0, mode="function"))
     chunks = list(chunker.chunk(path))
     assert chunks
 
@@ -559,7 +559,7 @@ def test_java_constructor_and_type_kinds(tmp_path: Path) -> None:
     )
     path = _write(tmp_path / "A.java", code)
 
-    chunker = TreeSitterChunker(Config(chunk_size=400, overlap_ratio=0.0, boundary=ScopeKind.FUNCTION))
+    chunker = TreeSitterChunker(Config(chunk_size=400, overlap_ratio=0.0, mode="function"))
     chunks = list(chunker.chunk(path))
     assert chunks
 
@@ -568,7 +568,7 @@ def test_java_constructor_and_type_kinds(tmp_path: Path) -> None:
     assert any(any(s.kind == ScopeKind.TYPE and s.name == "E" for s in c.scope_path) for c in chunks)
     assert any(any(s.kind == ScopeKind.TYPE and s.name == "R" for s in c.scope_path) for c in chunks)
     assert any(any(s.kind == ScopeKind.TYPE and s.name == "A" for s in c.scope_path) for c in chunks)
-    # With the optimized FUNCTION-boundary behavior, small TYPE nodes may be emitted as a single chunk,
+    # With the optimized mode="function" behavior, small TYPE nodes may be emitted as a single chunk,
     # and their inner functions are reported via contained_scopes.
     assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "A" for s in c.contained_scopes) for c in chunks)
     assert any(any(s.kind == ScopeKind.FUNCTION and s.name == "m" for s in c.contained_scopes) for c in chunks)
