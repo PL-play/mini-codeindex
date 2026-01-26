@@ -33,3 +33,4 @@ htmlcov/
 .ipynb_checkpoints/
 
 .env
+docker/chromadb/chroma_data

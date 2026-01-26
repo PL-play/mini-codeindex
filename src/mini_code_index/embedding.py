@@ -100,7 +100,7 @@ class OpenAICompatibleEmbedder:
     """
 
     api_key: str
-    model: str = ""
+    model: str = "text-embedding-3-small"
     base_url: str = "https://api.openai.com"
     timeout_s: float = 60.0
     batch_size: int = 128

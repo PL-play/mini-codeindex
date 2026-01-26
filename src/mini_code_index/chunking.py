@@ -20,7 +20,12 @@ try:  # tree-sitter is optional at runtime for learning/debugging
     _HAS_TREESITTER = True
 except Exception:  # pragma: nocover
     Node = object  # type: ignore
-    Point = object  # type: ignore
+
+    @dataclass(frozen=True)
+    class Point:  # type: ignore
+        row: int
+        column: int
+
     SupportedLanguage = object  # type: ignore
 
     _HAS_TREESITTER = False
@@ -152,7 +157,7 @@ class Config:
     # - "type": type container as primary unit
     # - "function": function/method as primary unit (but small types are emitted whole)
     # - "auto_ast": legacy "AST window packing" (best-effort structural chunks)
-    mode: Optional[str] = None
+    mode: Optional[str] = None # "file", "type", "function", "auto_ast"
 
     def __post_init__(self) -> None:
         if self.chunk_filters is None:

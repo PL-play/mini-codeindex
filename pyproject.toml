@@ -16,11 +16,17 @@ mini-code-index = "mini_code_index.cli:main"
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "python-dotenv>=1.0",
+  "chromadb<=0.6.3",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "integration: integration tests that may require external services (e.g. ChromaDB)",
+]
 
 [build-system]
 requires = ["setuptools>=69"]

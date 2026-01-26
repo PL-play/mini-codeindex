@@ -1,0 +1,26 @@
+services:
+  chromadb:
+    image: chromadb/chroma:0.6.3
+    container_name: chromadb
+    restart: unless-stopped
+    ports:
+      - "8010:8000"
+    environment:
+      # Disable telemetry
+      ANONYMIZED_TELEMETRY: "False"
+      # Enable persistence
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: "${PERSIST_DIRECTORY:-/chroma/chroma}"
+    volumes:
+      - chroma_data:${PERSIST_DIRECTORY:-/chroma/chroma}
+    # Note: Don't override `command` here.
+    # The official image starts the server via its own ENTRYPOINT (uvicorn).
+    # Overriding `command` would pass args to uvicorn and break startup.
+
+volumes:
+  chroma_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./chroma_data
