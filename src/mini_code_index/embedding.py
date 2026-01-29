@@ -8,9 +8,14 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Protocol, Sequence
 
+import logging
+
 
 class EmbeddingError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
 
 
 class Embedder(Protocol):
@@ -35,12 +40,20 @@ def _create_token_aware_batches(
     if not token_limit:
         return [list(texts[i : i + batch_size]) for i in range(0, len(texts), batch_size)]
 
+    token_counts = [_estimate_tokens(t) for t in texts]
+    if token_counts and max(token_counts) > token_limit:
+        raise EmbeddingError(
+            f"Single input exceeds token limit ({token_limit} tokens)."
+        )
+
+    if sum(token_counts) <= token_limit:
+        return [list(texts)]
+
     batches: list[list[str]] = []
     current: list[str] = []
     current_tokens = 0
 
-    for t in texts:
-        t_tokens = _estimate_tokens(t)
+    for t, t_tokens in zip(texts, token_counts):
 
         would_exceed_tokens = current_tokens + t_tokens > token_limit
         would_exceed_batch = len(current) >= batch_size
@@ -243,7 +256,18 @@ class OpenAICompatibleEmbedder:
         batches = _create_token_aware_batches(
             list(texts), batch_size=self.batch_size, token_limit=self.token_limit
         )
+        logger.info(
+            "Embedding %d texts in %d batch(es) (batch_size=%d, token_limit=%s)",
+            len(texts),
+            len(batches),
+            self.batch_size,
+            str(self.token_limit),
+        )
         for batch in batches:
+            approx_tokens = sum(_estimate_tokens(t) for t in batch)
+            logger.info(
+                "Embedding batch size=%d approx_tokens=%d", len(batch), approx_tokens
+            )
             payload = self._request(batch)
             vectors.extend(_parse_openai_embeddings_response(payload, n_expected=len(batch)))
         return vectors

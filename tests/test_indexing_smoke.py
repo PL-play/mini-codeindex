@@ -9,6 +9,20 @@ from mini_code_index.db import ChromaStore, VectorStore
 from mini_code_index.embedding import OpenAICompatibleEmbedder, Embedder
 from mini_code_index.indexing import IndexConfig, index_directory, iter_candidate_files
 
+
+def _load_dotenv(path: str) -> None:
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+
 class DummyEmbedder(Embedder):
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         return [[0.0] for _ in texts]
@@ -214,5 +228,47 @@ def test_index_directory_no_error() -> None:
     store = CaptureStore()
     embedder = DummyEmbedder()
 
+    stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    print(stats)
+
+
+@pytest.mark.integration
+def test_full_pipeline_with_real_services() -> None:
+    """Run end-to-end indexing using real embeddings + ChromaDB."""
+
+    _load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+    chroma_host = os.environ.get("CHROMADB_HOST")
+    if not chroma_host:
+        pytest.skip("CHROMADB_HOST not set")
+
+    try:
+        embedder = OpenAICompatibleEmbedder.from_env()
+    except Exception as e:
+        pytest.skip(f"Embedder config missing: {e}")
+
+    test_project_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
+    cfg = IndexConfig(
+        root_dir=str(test_project_dir),
+        dry_run=False,
+        recursive=True,
+        include_hidden=False,
+        include_globs=["**/*"],
+        exclude_globs=[
+            "**/.git/**",
+            "**/.venv/**",
+            "**/__pycache__/**",
+            "**/.pytest_cache/**",
+            "**.class",
+        ],
+    )
+    chunk_cfg = ChunkConfig(
+        chunk_size=1200,
+        overlap_ratio=0.1,
+        encoding="utf8",
+        mode="function",
+    )
+
+    store = ChromaStore(base_url=chroma_host, root_dir=str(test_project_dir))
     stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
     print(stats)

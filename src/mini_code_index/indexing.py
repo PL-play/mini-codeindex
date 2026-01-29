@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import hashlib
 import logging
 import os
@@ -11,6 +12,7 @@ from typing import Any, Iterable, Iterator, List, Optional, Sequence
 from .chunking import Chunk, Config as ChunkConfig, TreeSitterChunker, format_scope
 from .db import VectorStore
 from .embedding import Embedder
+from .logging_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -244,12 +246,12 @@ def _build_chunk_metadata(
         "relpath": rel_path,
         "sha256": file_sha256,
         "chunk_kind": chunk_kind,
-        "scope_path": scope_path_list,
-        "contained_scopes": contained_scopes_list,
+        "scope_path": json.dumps(scope_path_list, ensure_ascii=False),
+        "contained_scopes": json.dumps(contained_scopes_list, ensure_ascii=False),
         "scope_path_str": scope_path_str,
         "contained_scopes_str": contained_scopes_str,
         "scope_depth": len(chunk.scope_path),
-        "symbol_names": symbol_names,
+        "symbol_names": json.dumps(symbol_names, ensure_ascii=False),
         "scope_signature": scope_signature,
         "contained_scope_count": len(chunk.contained_scopes),
     }
@@ -298,6 +300,47 @@ def _expand_chunks(*, chunks: list[Chunk], file_path: str, rel_path: str) -> lis
     return expanded
 
 
+def _prepare_chunks_for_file(
+    *,
+    file_path: str,
+    rel_path: str,
+    file_sha256: str,
+    chunker: TreeSitterChunker,
+) -> list[tuple[Chunk, str]]:
+    chunks: List[Chunk] = list(chunker.chunk(file_path))
+    if not chunks:
+        return []
+
+    for c in chunks:
+        c.path = file_path
+        c.sha256 = file_sha256
+
+    return _expand_chunks(chunks=chunks, file_path=file_path, rel_path=rel_path)
+
+
+def _build_upsert_payloads(
+    *,
+    expanded_chunks: list[tuple[Chunk, str]],
+    file_path: str,
+    file_sha256: str,
+    rel_path: str,
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    texts = [c.text for c, _ in expanded_chunks]
+    ids = [_new_id() for _ in expanded_chunks]
+    metadatas: list[dict[str, Any]] = []
+    for c, kind in expanded_chunks:
+        metadatas.append(
+            _build_chunk_metadata(
+                chunk=c,
+                file_path=file_path,
+                file_sha256=file_sha256,
+                rel_path=rel_path,
+                chunk_kind=kind,
+            )
+        )
+    return texts, ids, metadatas
+
+
 def index_directory(
     *,
     cfg: IndexConfig,
@@ -313,9 +356,19 @@ def index_directory(
     - We only write if cfg.dry_run is False AND store is provided.
     """
 
+    setup_logging()
     stats = IndexStats()
     chunk_cfg = chunk_cfg or ChunkConfig()
     chunker = TreeSitterChunker(chunk_cfg)
+
+    logger.info(
+        "Indexing start: root=%s dry_run=%s mode=%s chunk_size=%s overlap=%s",
+        cfg.root_dir,
+        cfg.dry_run,
+        chunk_cfg.mode,
+        chunk_cfg.chunk_size,
+        chunk_cfg.overlap_ratio,
+    )
 
     if not cfg.dry_run and store is None:
         raise ValueError("store is required when dry_run=False")
@@ -324,6 +377,7 @@ def index_directory(
     
     for file_path in iter_candidate_files(cfg):
         stats.files_seen += 1
+        logger.debug("Scanning file: %s", file_path)
 
         # Default behaviour: skip non-text/binary files (images, archives, etc).
         if not _is_probably_text_file(file_path, chunk_cfg=chunk_cfg):
@@ -336,16 +390,20 @@ def index_directory(
             continue
 
         rel_path = os.path.relpath(file_path, cfg.root_dir).replace(os.sep, "/")
-        chunks: List[Chunk] = list(chunker.chunk(file_path))
-        if not chunks:
+        logger.info("Chunking file: %s", file_path)
+        expanded_chunks = _prepare_chunks_for_file(
+            file_path=file_path,
+            rel_path=rel_path,
+            file_sha256=file_sha256,
+            chunker=chunker,
+        )
+        if not expanded_chunks:
+            logger.info("No chunks emitted for: %s", file_path)
             continue
 
-        # Attach minimal metadata (VectorCode-style) for downstream store.
-        for c in chunks:
-            c.path = file_path
-            c.sha256 = file_sha256
-
-        expanded_chunks = _expand_chunks(chunks=chunks, file_path=file_path, rel_path=rel_path)
+        logger.info(
+            "Chunks emitted for %s: %d", file_path, len(expanded_chunks)
+        )
 
         stats.files_indexed += 1
         stats.chunks_emitted += len(expanded_chunks)
@@ -361,29 +419,32 @@ def index_directory(
         # VectorCode-style update strategy: delete all existing chunks for the file,
         # then re-insert. This keeps the implementation simple even when chunk IDs
         # are not stable across runs.
+        logger.info("Deleting existing vectors for: %s", file_path)
         store.delete_by_path(path=file_path)
 
         # Batch embed + upsert. This is the main shape; we will refine metadata
         # and update strategy (delete-by-path vs stable IDs) later.
-        texts = [c.text for c, _ in expanded_chunks]
-        ids = [_new_id() for _ in expanded_chunks]
-        metadatas: list[dict[str, Any]] = []
-        for c, kind in expanded_chunks:
-            metadatas.append(
-                _build_chunk_metadata(
-                    chunk=c,
-                    file_path=file_path,
-                    file_sha256=file_sha256,
-                    rel_path=rel_path,
-                    chunk_kind=kind,
-                )
-            )
+        texts, ids, metadatas = _build_upsert_payloads(
+            expanded_chunks=expanded_chunks,
+            file_path=file_path,
+            file_sha256=file_sha256,
+            rel_path=rel_path,
+        )
+        logger.info("Embedding %d chunks for %s", len(texts), file_path)
 
         for i in range(0, len(texts), batch_size):
             batch_docs = texts[i : i + batch_size]
             batch_ids = ids[i : i + batch_size]
             batch_meta = metadatas[i : i + batch_size]
+            logger.info(
+                "Embedding batch %d-%d (%d items) for %s",
+                i,
+                min(i + batch_size, len(texts)) - 1,
+                len(batch_docs),
+                file_path,
+            )
             batch_vecs = embedder.embed(batch_docs)
+            logger.info("Upserting %d vectors for %s", len(batch_docs), file_path)
             store.upsert(
                 ids=batch_ids,
                 documents=batch_docs,
@@ -391,4 +452,10 @@ def index_directory(
                 metadatas=batch_meta,
             )
 
+    logger.info(
+        "Indexing complete: files_seen=%d files_indexed=%d chunks=%d",
+        stats.files_seen,
+        stats.files_indexed,
+        stats.chunks_emitted,
+    )
     return stats
