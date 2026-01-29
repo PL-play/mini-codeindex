@@ -44,7 +44,7 @@ def _collection_name_for_root(root_dir: str) -> str:
 
     full = os.path.abspath(os.path.expanduser(root_dir))
     hasher = hashlib.sha256(full.encode("utf-8"))
-    return "mci_" + hasher.hexdigest()[:59]
+    return hasher.hexdigest()[:63]
 
 
 @dataclass

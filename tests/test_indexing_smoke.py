@@ -1,13 +1,48 @@
 import os
 import random
+from typing import Sequence, Mapping, Any
 
 import pytest
 
 from mini_code_index.chunking import Config as ChunkConfig, TreeSitterChunker, format_scope
-from mini_code_index.db import ChromaStore
-from mini_code_index.embedding import OpenAICompatibleEmbedder
+from mini_code_index.db import ChromaStore, VectorStore
+from mini_code_index.embedding import OpenAICompatibleEmbedder, Embedder
 from mini_code_index.indexing import IndexConfig, index_directory, iter_candidate_files
 
+class DummyEmbedder(Embedder):
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return [[0.0] for _ in texts]
+
+class CaptureStore(VectorStore):
+    def __init__(self) -> None:
+        self.deleted_paths: list[str] = []
+        self.upserts: list[dict[str, Any]] = []
+
+    def ping(self) -> bool:  # pragma: nocover - not used in tests
+        return True
+
+    def delete_by_path(self, *, path: str) -> None:
+        self.deleted_paths.append(path)
+
+    def get_upserts(self, path: str) -> list[dict[str, Any]]:
+        return self.upserts
+
+    def upsert(
+        self,
+        *,
+        ids: Sequence[str],
+        documents: Sequence[str],
+        embeddings: Sequence[Sequence[float]],
+        metadatas: Sequence[Mapping[str, Any]],
+    ) -> None:
+        self.upserts.append(
+            {
+                "ids": list(ids),
+                "documents": list(documents),
+                "embeddings": [list(v) for v in embeddings],
+                "metadatas": [dict(m) for m in metadatas],
+            }
+        )
 
 @pytest.mark.integration
 def test_index_directory_smoke(tmp_path) -> None:
@@ -148,3 +183,36 @@ def test_chunk_directory_with_complex_code(tmp_path) -> None:
 
     except Exception as e:
         pytest.fail(f"Chunking failed with exception: {e}")
+
+
+@pytest.mark.integration
+def test_index_directory_no_error() -> None:
+    """Run index_directory on the complex test project and ensure no error."""
+
+    test_project_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
+    cfg = IndexConfig(
+        root_dir=str(test_project_dir),
+        dry_run=False,
+        recursive=True,
+        include_hidden=False,
+        include_globs=["**/*"],
+        exclude_globs=[
+            "**/.git/**",
+            "**/.venv/**",
+            "**/__pycache__/**",
+            "**/.pytest_cache/**",
+            "**.class",
+        ],
+    )
+
+    chunk_cfg = ChunkConfig(
+        chunk_size=1200,
+        overlap_ratio=0.1,
+        encoding="utf8",
+        mode="function",
+    )
+    store = CaptureStore()
+    embedder = DummyEmbedder()
+
+    stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    print(stats)

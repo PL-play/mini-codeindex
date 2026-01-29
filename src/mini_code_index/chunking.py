@@ -72,6 +72,8 @@ class Scope:
     name: str
     # Original tree-sitter node.type that produced this scope (debugging/extension aid).
     raw_type: Optional[str] = None
+    # Optional relative path (used for file scopes).
+    rel_path: Optional[str] = None
 
 
 @dataclass
@@ -104,6 +106,8 @@ class Chunk:
 
 def format_scope(scope: Scope) -> str:
     raw = scope.raw_type if scope.raw_type is not None else "?"
+    if scope.kind == ScopeKind.FILE and scope.rel_path:
+        return f"{scope.kind.value}:{scope.name}<{raw}>@{scope.rel_path}"
     return f"{scope.kind.value}:{scope.name}<{raw}>"
 
 
@@ -1085,9 +1089,13 @@ class TreeSitterChunker:
         sha256_value = hashlib.sha256(content_bytes).hexdigest() if path is not None else None
 
         module_value: Optional[str] = None
+        module_relpath: Optional[str] = None
         if path is not None:
             base = os.path.basename(path)
-            module_value = os.path.splitext(base)[0]
+            module_value = base
+            module_relpath = os.path.relpath(path).replace(os.sep, "/")
+            while module_relpath.startswith("../"):
+                module_relpath = module_relpath[3:]
 
         # Resolve language as early as possible so even the whole-file fast-path
         # can still report `language`.
@@ -1114,7 +1122,18 @@ class TreeSitterChunker:
                 sha256=sha256_value,
                 language=lang,
                 scope_path=[
-                    *( [Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file")] if module_value else [] ),
+                    *(
+                        [
+                            Scope(
+                                kind=ScopeKind.FILE,
+                                name=module_value,
+                                raw_type="file",
+                                rel_path=module_relpath,
+                            )
+                        ]
+                        if module_value
+                        else []
+                    ),
                 ],
                 contained_scopes=[],
             )
@@ -1138,7 +1157,18 @@ class TreeSitterChunker:
                     sha256=sha256_value,
                     language=lang,
                     scope_path=[
-                        *( [Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file")] if module_value else [] ),
+                        *(
+                            [
+                                Scope(
+                                    kind=ScopeKind.FILE,
+                                    name=module_value,
+                                    raw_type="file",
+                                    rel_path=module_relpath,
+                                )
+                            ]
+                            if module_value
+                            else []
+                        ),
                     ],
                     contained_scopes=[],
                 )
@@ -1231,7 +1261,18 @@ class TreeSitterChunker:
                     sha256=sha256_value,
                     language=lang,
                     scope_path=[
-                        *( [Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file")] if module_value else [] ),
+                        *(
+                            [
+                                Scope(
+                                    kind=ScopeKind.FILE,
+                                    name=module_value,
+                                    raw_type="file",
+                                    rel_path=module_relpath,
+                                )
+                            ]
+                            if module_value
+                            else []
+                        ),
                     ],
                     contained_scopes=contained,
                 )
@@ -1244,7 +1285,14 @@ class TreeSitterChunker:
 
             base_scopes: list[Scope] = []
             if module_value:
-                base_scopes.append(Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file"))
+                base_scopes.append(
+                    Scope(
+                        kind=ScopeKind.FILE,
+                        name=module_value,
+                        raw_type="file",
+                        rel_path=module_relpath,
+                    )
+                )
 
             chunks = self._chunk_node_auto_ast(
                 tree.root_node, content_bytes, language=lang, scope_stack=base_scopes
@@ -1281,8 +1329,14 @@ class TreeSitterChunker:
 
         base_scopes: list[Scope] = []
         if module_value:
-            # Keep name as file-stem for stability across extensions.
-            base_scopes.append(Scope(kind=ScopeKind.FILE, name=module_value, raw_type="file"))
+            base_scopes.append(
+                Scope(
+                    kind=ScopeKind.FILE,
+                    name=module_value,
+                    raw_type="file",
+                    rel_path=module_relpath,
+                )
+            )
 
         chunks = self._chunk_node(tree.root_node, content_bytes, language=lang, scope_stack=base_scopes)
 

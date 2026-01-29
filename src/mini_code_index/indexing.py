@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, List, Optional, Sequence
 
-from .chunking import Chunk, Config as ChunkConfig, TreeSitterChunker
+from .chunking import Chunk, Config as ChunkConfig, TreeSitterChunker, format_scope
 from .db import VectorStore
 from .embedding import Embedder
 
@@ -214,13 +214,97 @@ def iter_candidate_files(cfg: IndexConfig) -> Iterator[str]:
                 yield path
 
 
+def _build_chunk_metadata(
+    *,
+    chunk: Chunk,
+    file_path: str,
+    file_sha256: str,
+    rel_path: str,
+    chunk_kind: str = "code",
+) -> dict[str, Any]:
+    def scope_to_dict(scope: Any) -> dict[str, Any]:
+        return {
+            "kind": getattr(scope.kind, "value", str(scope.kind)),
+            "name": scope.name,
+            "raw_type": scope.raw_type,
+            "rel_path": getattr(scope, "rel_path", None),
+        }
+
+    scope_path_list = [scope_to_dict(s) for s in chunk.scope_path]
+    contained_scopes_list = [scope_to_dict(s) for s in chunk.contained_scopes]
+    scope_path_str = " -> ".join(format_scope(s) for s in chunk.scope_path)
+    contained_scopes_str = ", ".join(format_scope(s) for s in chunk.contained_scopes)
+    symbol_names = [s.name for s in chunk.scope_path if getattr(s, "name", None)]
+    scope_signature = " -> ".join(
+        f"{getattr(s.kind, 'value', s.kind)} {s.name}" for s in chunk.scope_path
+    )
+
+    meta: dict[str, Any] = {
+        "path": file_path,
+        "relpath": rel_path,
+        "sha256": file_sha256,
+        "chunk_kind": chunk_kind,
+        "scope_path": scope_path_list,
+        "contained_scopes": contained_scopes_list,
+        "scope_path_str": scope_path_str,
+        "contained_scopes_str": contained_scopes_str,
+        "scope_depth": len(chunk.scope_path),
+        "symbol_names": symbol_names,
+        "scope_signature": scope_signature,
+        "contained_scope_count": len(chunk.contained_scopes),
+    }
+    if chunk.start is not None:
+        meta["start_line"] = int(getattr(chunk.start, "row", 0))
+        meta["start_col"] = int(getattr(chunk.start, "column", 0))
+    if chunk.end is not None:
+        meta["end_line"] = int(getattr(chunk.end, "row", 0))
+        meta["end_col"] = int(getattr(chunk.end, "column", 0))
+    if chunk.language is not None:
+        meta["language"] = chunk.language
+    return meta
+
+
+def _expand_chunks(*, chunks: list[Chunk], file_path: str, rel_path: str) -> list[tuple[Chunk, str]]:
+    expanded: list[tuple[Chunk, str]] = [(c, "code") for c in chunks]
+
+    def _attach_source(meta_chunk: Chunk, *, source: Chunk | None) -> Chunk:
+        meta_chunk.path = file_path
+        if source is not None:
+            meta_chunk.sha256 = source.sha256
+            meta_chunk.language = source.language
+            meta_chunk.scope_path = list(source.scope_path)
+            meta_chunk.contained_scopes = list(source.contained_scopes)
+            meta_chunk.start = source.start
+            meta_chunk.end = source.end
+        return meta_chunk
+
+    rel_chunk = _attach_source(Chunk(text=f"relpath: {rel_path}"), source=chunks[0] if chunks else None)
+    expanded.append((rel_chunk, "relpath"))
+
+    for source in chunks:
+        if len(source.scope_path) <= 1:
+            continue
+        scope_path_str = " -> ".join(format_scope(s) for s in source.scope_path)
+        if not scope_path_str:
+            continue
+        containers_str = ", ".join(format_scope(s) for s in source.contained_scopes)
+        suffix = f" | containers: {containers_str}" if containers_str else ""
+        scope_chunk = _attach_source(
+            Chunk(text=f"scope_path: {scope_path_str}{suffix}"),
+            source=source,
+        )
+        expanded.append((scope_chunk, "scope_path"))
+
+    return expanded
+
+
 def index_directory(
     *,
     cfg: IndexConfig,
     chunk_cfg: Optional[ChunkConfig] = None,
     embedder: Optional[Embedder] = None,
     store: Optional[VectorStore] = None,
-    batch_size: int = 128,
+    batch_size: int = 16,
 ) -> IndexStats:
     """Index a directory end-to-end (scan -> chunk -> embed -> write).
 
@@ -251,6 +335,7 @@ def index_directory(
         except OSError:
             continue
 
+        rel_path = os.path.relpath(file_path, cfg.root_dir).replace(os.sep, "/")
         chunks: List[Chunk] = list(chunker.chunk(file_path))
         if not chunks:
             continue
@@ -260,8 +345,10 @@ def index_directory(
             c.path = file_path
             c.sha256 = file_sha256
 
+        expanded_chunks = _expand_chunks(chunks=chunks, file_path=file_path, rel_path=rel_path)
+
         stats.files_indexed += 1
-        stats.chunks_emitted += len(chunks)
+        stats.chunks_emitted += len(expanded_chunks)
 
         if cfg.dry_run:
             continue
@@ -278,21 +365,19 @@ def index_directory(
 
         # Batch embed + upsert. This is the main shape; we will refine metadata
         # and update strategy (delete-by-path vs stable IDs) later.
-        texts = [c.text for c in chunks]
-        ids = [_new_id() for _ in chunks]
+        texts = [c.text for c, _ in expanded_chunks]
+        ids = [_new_id() for _ in expanded_chunks]
         metadatas: list[dict[str, Any]] = []
-        for c in chunks:
-            meta: dict[str, Any] = {
-                "path": c.path,
-                "sha256": c.sha256,
-            }
-            if c.start is not None:
-                meta["start_line"] = int(getattr(c.start, "row", 0))
-            if c.end is not None:
-                meta["end_line"] = int(getattr(c.end, "row", 0))
-            if c.language is not None:
-                meta["language"] = c.language
-            metadatas.append(meta)
+        for c, kind in expanded_chunks:
+            metadatas.append(
+                _build_chunk_metadata(
+                    chunk=c,
+                    file_path=file_path,
+                    file_sha256=file_sha256,
+                    rel_path=rel_path,
+                    chunk_kind=kind,
+                )
+            )
 
         for i in range(0, len(texts), batch_size):
             batch_docs = texts[i : i + batch_size]
