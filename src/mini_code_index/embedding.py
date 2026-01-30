@@ -253,21 +253,79 @@ class OpenAICompatibleEmbedder:
             return []
 
         vectors: list[list[float]] = []
+        embed_start_time = time.time()
+        text_lengths = [len(t) for t in texts]
+        total_chars = sum(text_lengths)
+        min_chars = min(text_lengths) if text_lengths else 0
+        max_chars = max(text_lengths) if text_lengths else 0
+        avg_chars = int(total_chars / len(texts)) if texts else 0
+        logger.info(
+            "[EMBED_INPUT] texts=%d chars(min/avg/max)=%d/%d/%d",
+            len(texts),
+            min_chars,
+            avg_chars,
+            max_chars,
+        )
         batches = _create_token_aware_batches(
             list(texts), batch_size=self.batch_size, token_limit=self.token_limit
         )
-        logger.info(
-            "Embedding %d texts in %d batch(es) (batch_size=%d, token_limit=%s)",
+        logger.debug(
+            "[EMBED_BATCHING] %d texts -> %d batch(es) (max_batch=%d, token_limit=%s)",
             len(texts),
             len(batches),
             self.batch_size,
             str(self.token_limit),
         )
+        
+        batch_num = 0
+        total_tokens = 0
+        dims_seen: set[int] = set()
         for batch in batches:
+            batch_num += 1
             approx_tokens = sum(_estimate_tokens(t) for t in batch)
+            total_tokens += approx_tokens
+            batch_chars = sum(len(t) for t in batch)
             logger.info(
-                "Embedding batch size=%d approx_tokens=%d", len(batch), approx_tokens
+                "    [BATCH %d] input_texts=%d chars=%d tokens=%d",
+                batch_num,
+                len(batch),
+                batch_chars,
+                approx_tokens,
             )
+            logger.debug(
+                "    [BATCH %d] size=%d tokens=%d model=%s",
+                batch_num,
+                len(batch),
+                approx_tokens,
+                self.model,
+            )
+            req_start = time.time()
             payload = self._request(batch)
-            vectors.extend(_parse_openai_embeddings_response(payload, n_expected=len(batch)))
+            req_elapsed = time.time() - req_start
+            logger.debug("    [BATCH %d] API request completed (%.2fs)", batch_num, req_elapsed)
+            batch_vectors = _parse_openai_embeddings_response(payload, n_expected=len(batch))
+            if batch_vectors:
+                dims_seen.add(len(batch_vectors[0]))
+            logger.info(
+                "    [BATCH %d] output_vectors=%d dim=%s",
+                batch_num,
+                len(batch_vectors),
+                len(batch_vectors[0]) if batch_vectors else 0,
+            )
+            vectors.extend(batch_vectors)
+        
+        embed_elapsed = time.time() - embed_start_time
+        dim_summary = ",".join(str(d) for d in sorted(dims_seen)) if dims_seen else "0"
+        logger.info(
+            "[EMBED_OUTPUT] vectors=%d dims=%s elapsed=%.2fs",
+            len(vectors),
+            dim_summary,
+            embed_elapsed,
+        )
+        logger.debug(
+            "[EMBED_SUMMARY] %d texts embedded | total_tokens=%d | elapsed=%.2fs",
+            len(texts),
+            total_tokens,
+            embed_elapsed,
+        )
         return vectors

@@ -24,6 +24,8 @@ dev = [
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src"]
+log_cli = true
+log_cli_level = "INFO"
 markers = [
   "integration: integration tests that may require external services (e.g. ChromaDB)",
 ]

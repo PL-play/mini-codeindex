@@ -1,6 +1,6 @@
 import os
 import random
-from typing import Sequence, Mapping, Any
+from typing import Sequence, Mapping, Any, Optional
 
 import pytest
 
@@ -23,9 +23,11 @@ def _load_dotenv(path: str) -> None:
             value = value.strip().strip('"').strip("'")
             os.environ.setdefault(key, value)
 
+
 class DummyEmbedder(Embedder):
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         return [[0.0] for _ in texts]
+
 
 class CaptureStore(VectorStore):
     def __init__(self) -> None:
@@ -35,6 +37,9 @@ class CaptureStore(VectorStore):
     def ping(self) -> bool:  # pragma: nocover - not used in tests
         return True
 
+    def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]:
+        return None
+
     def delete_by_path(self, *, path: str) -> None:
         self.deleted_paths.append(path)
 
@@ -42,12 +47,12 @@ class CaptureStore(VectorStore):
         return self.upserts
 
     def upsert(
-        self,
-        *,
-        ids: Sequence[str],
-        documents: Sequence[str],
-        embeddings: Sequence[Sequence[float]],
-        metadatas: Sequence[Mapping[str, Any]],
+            self,
+            *,
+            ids: Sequence[str],
+            documents: Sequence[str],
+            embeddings: Sequence[Sequence[float]],
+            metadatas: Sequence[Mapping[str, Any]],
     ) -> None:
         self.upserts.append(
             {
@@ -57,6 +62,7 @@ class CaptureStore(VectorStore):
                 "metadatas": [dict(m) for m in metadatas],
             }
         )
+
 
 @pytest.mark.integration
 def test_index_directory_smoke(tmp_path) -> None:
@@ -134,18 +140,18 @@ def test_chunk_directory_with_complex_code(tmp_path) -> None:
     all_chunks = []
     try:
         for file_path in iter_candidate_files(IndexConfig(
-            root_dir=str(test_project_dir),
-            dry_run=True,
-            recursive=True,
-            include_hidden=False,
-            include_globs=["**/*"],
-            exclude_globs=[
-                "**/.git/**",
-                "**/.venv/**",
-                "**/__pycache__/**",
-                "**/.pytest_cache/**",
-                "**.class"
-            ],
+                root_dir=str(test_project_dir),
+                dry_run=True,
+                recursive=True,
+                include_hidden=False,
+                include_globs=["**/*"],
+                exclude_globs=[
+                    "**/.git/**",
+                    "**/.venv/**",
+                    "**/__pycache__/**",
+                    "**/.pytest_cache/**",
+                    "**.class"
+                ],
         )):
             try:
                 chunks = list(chunker.chunk(file_path))
@@ -270,5 +276,6 @@ def test_full_pipeline_with_real_services() -> None:
     )
 
     store = ChromaStore(base_url=chroma_host, root_dir=str(test_project_dir))
-    stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store, force_upsert=True,
+                            batch_size=128)
     print(stats)

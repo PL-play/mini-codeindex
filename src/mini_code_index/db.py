@@ -23,6 +23,8 @@ class VectorStore(Protocol):
 
     def ping(self) -> bool: ...
 
+    def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]: ...
+
     def delete_by_path(self, *, path: str) -> None: ...
 
     def upsert(
@@ -120,6 +122,19 @@ class ChromaStore(VectorStore):
         self._collection = client.get_or_create_collection(name=name, metadata=meta)
         return self._collection
 
+    def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]:
+        collection = self._ensure_collection()
+        full = os.path.abspath(os.path.expanduser(path))
+        try:
+            result = collection.get(where={"path": full}, limit=1, include=["metadatas"])
+        except TypeError:
+            result = collection.get(where={"path": full}, include=["metadatas"])
+
+        metadatas = (result or {}).get("metadatas") or []
+        if not metadatas or not isinstance(metadatas[0], dict):
+            return None
+        return metadatas[0]
+
     def delete_by_path(self, *, path: str) -> None:
         collection = self._ensure_collection()
         full = os.path.abspath(os.path.expanduser(path))
@@ -143,3 +158,4 @@ class ChromaStore(VectorStore):
             embeddings=[list(map(float, v)) for v in embeddings],
             metadatas=[dict(m) for m in metadatas],
         )
+

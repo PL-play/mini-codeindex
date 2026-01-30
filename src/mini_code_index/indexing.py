@@ -5,6 +5,7 @@ import json
 import hashlib
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, List, Optional, Sequence
@@ -245,6 +246,7 @@ def _build_chunk_metadata(
         "path": file_path,
         "relpath": rel_path,
         "sha256": file_sha256,
+        "created_at": int(time.time()),
         "chunk_kind": chunk_kind,
         "scope_path": json.dumps(scope_path_list, ensure_ascii=False),
         "contained_scopes": json.dumps(contained_scopes_list, ensure_ascii=False),
@@ -297,6 +299,19 @@ def _expand_chunks(*, chunks: list[Chunk], file_path: str, rel_path: str) -> lis
         )
         expanded.append((scope_chunk, "scope_path"))
 
+    kind_counts: dict[str, int] = {}
+    for _, kind in expanded:
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+    kind_summary = ", ".join(f"{k}={v}" for k, v in sorted(kind_counts.items()))
+    logger.info(
+        "[EXPAND] file=%s base=%d expanded=%d added=%d types: %s",
+        file_path,
+        len(chunks),
+        len(expanded),
+        max(0, len(expanded) - len(chunks)),
+        kind_summary,
+    )
+
     return expanded
 
 
@@ -347,6 +362,7 @@ def index_directory(
     chunk_cfg: Optional[ChunkConfig] = None,
     embedder: Optional[Embedder] = None,
     store: Optional[VectorStore] = None,
+    force_upsert: bool = False,
     batch_size: int = 16,
 ) -> IndexStats:
     """Index a directory end-to-end (scan -> chunk -> embed -> write).
@@ -361,13 +377,17 @@ def index_directory(
     chunk_cfg = chunk_cfg or ChunkConfig()
     chunker = TreeSitterChunker(chunk_cfg)
 
+    index_start_time = time.time()
     logger.info(
-        "Indexing start: root=%s dry_run=%s mode=%s chunk_size=%s overlap=%s",
+        "=" * 80
+    )
+    logger.info(
+        "INDEXING START: root=%s | mode=%s | chunk_size=%s | overlap=%s | dry_run=%s",
         cfg.root_dir,
-        cfg.dry_run,
         chunk_cfg.mode,
         chunk_cfg.chunk_size,
         chunk_cfg.overlap_ratio,
+        cfg.dry_run,
     )
 
     if not cfg.dry_run and store is None:
@@ -381,7 +401,7 @@ def index_directory(
 
         # Default behaviour: skip non-text/binary files (images, archives, etc).
         if not _is_probably_text_file(file_path, chunk_cfg=chunk_cfg):
-            logger.info("Skipping non-text file: %s", file_path)
+            logger.debug("Skipping non-text file: %s", file_path)
             continue
 
         try:
@@ -390,7 +410,35 @@ def index_directory(
             continue
 
         rel_path = os.path.relpath(file_path, cfg.root_dir).replace(os.sep, "/")
-        logger.info("Chunking file: %s", file_path)
+        file_start_time = time.time()
+        logger.info(
+            "---\n[FILE] Processing: %s", file_path
+        )
+
+        if not cfg.dry_run:
+            if embedder is None:
+                raise ValueError("embedder is required when dry_run=False")
+            assert store is not None
+
+            existing = store.get_one_by_path(path=file_path)
+            existing_sha = existing.get("sha256") if isinstance(existing, dict) else None
+
+            if not force_upsert and existing_sha == file_sha256 and existing is not None:
+                file_elapsed = time.time() - file_start_time
+                logger.info(
+                    "[SKIP] Unchanged (sha256 match). elapsed=%.2fs\n",
+                    file_elapsed,
+                )
+                continue
+
+            if existing is not None:
+                store.delete_by_path(path=file_path)
+                if force_upsert and existing_sha == file_sha256:
+                    logger.info("[UPDATE] Force reindex: deleted existing vectors for: %s", file_path)
+                else:
+                    logger.info("[UPDATE] Deleted existing vectors for: %s", file_path)
+            else:
+                logger.info("[UPDATE] No existing vectors found for: %s", file_path)
         expanded_chunks = _prepare_chunks_for_file(
             file_path=file_path,
             rel_path=rel_path,
@@ -398,64 +446,134 @@ def index_directory(
             chunker=chunker,
         )
         if not expanded_chunks:
-            logger.info("No chunks emitted for: %s", file_path)
+            logger.debug("No chunks emitted for: %s", file_path)
             continue
 
+        base_chunks = sum(1 for _, kind in expanded_chunks if kind == "code")
+        expanded_total = len(expanded_chunks)
+        expansion_ratio = (expanded_total / base_chunks) if base_chunks else 0.0
+        chunk_lengths = [len(c.text) for c, _ in expanded_chunks]
+        total_chars = sum(chunk_lengths)
+        min_chars = min(chunk_lengths) if chunk_lengths else 0
+        max_chars = max(chunk_lengths) if chunk_lengths else 0
+        avg_chars = int(total_chars / expanded_total) if expanded_total else 0
         logger.info(
-            "Chunks emitted for %s: %d", file_path, len(expanded_chunks)
+            "[CHUNKING] base=%d expanded=%d ratio=%.2f chars(min/avg/max)=%d/%d/%d",
+            base_chunks,
+            expanded_total,
+            expansion_ratio,
+            min_chars,
+            avg_chars,
+            max_chars,
         )
+
+        # Analyze chunk types for better visibility
+        chunk_types_count = {}
+        chunk_kind_lengths: dict[str, list[int]] = {}
+        for chunk, chunk_kind in expanded_chunks:
+            chunk_types_count[chunk_kind] = chunk_types_count.get(chunk_kind, 0) + 1
+            chunk_kind_lengths.setdefault(chunk_kind, []).append(len(chunk.text))
+        
+        chunk_type_str = ", ".join([f"{k}={v}" for k, v in sorted(chunk_types_count.items())])
+        logger.info(
+            "[CHUNKING] Chunks emitted: %d total | Types: %s", 
+            len(expanded_chunks),
+            chunk_type_str
+        )
+        for kind, lengths in sorted(chunk_kind_lengths.items()):
+            if not lengths:
+                continue
+            kind_min = min(lengths)
+            kind_max = max(lengths)
+            kind_avg = int(sum(lengths) / len(lengths))
+            logger.info(
+                "[CHUNKING] kind=%s count=%d chars(min/avg/max)=%d/%d/%d",
+                kind,
+                len(lengths),
+                kind_min,
+                kind_avg,
+                kind_max,
+            )
 
         stats.files_indexed += 1
         stats.chunks_emitted += len(expanded_chunks)
 
         if cfg.dry_run:
+            file_elapsed = time.time() - file_start_time
+            logger.info("[DRY_RUN] Skipping embedding and upserting (elapsed: %.2fs)\n", file_elapsed)
             continue
-
-        if embedder is None:
-            raise ValueError("embedder is required when dry_run=False")
-
-        assert store is not None
-
-        # VectorCode-style update strategy: delete all existing chunks for the file,
-        # then re-insert. This keeps the implementation simple even when chunk IDs
-        # are not stable across runs.
-        logger.info("Deleting existing vectors for: %s", file_path)
-        store.delete_by_path(path=file_path)
 
         # Batch embed + upsert. This is the main shape; we will refine metadata
         # and update strategy (delete-by-path vs stable IDs) later.
+        embed_start_time = time.time()
+        upsert_total_time = 0.0
         texts, ids, metadatas = _build_upsert_payloads(
             expanded_chunks=expanded_chunks,
             file_path=file_path,
             file_sha256=file_sha256,
             rel_path=rel_path,
         )
-        logger.info("Embedding %d chunks for %s", len(texts), file_path)
+        logger.info("[EMBEDDING] Processing %d chunks...", len(texts))
 
+        batch_count = 0
         for i in range(0, len(texts), batch_size):
+            batch_count += 1
             batch_docs = texts[i : i + batch_size]
             batch_ids = ids[i : i + batch_size]
             batch_meta = metadatas[i : i + batch_size]
+            batch_start = time.time()
+            
             logger.info(
-                "Embedding batch %d-%d (%d items) for %s",
+                "  [BATCH %d/%d] Embedding and upserting: items [%d-%d] (%d chunks)",
+                batch_count,
+                (len(texts) + batch_size - 1) // batch_size,
                 i,
                 min(i + batch_size, len(texts)) - 1,
                 len(batch_docs),
-                file_path,
             )
+            embed_batch_start = time.time()
             batch_vecs = embedder.embed(batch_docs)
-            logger.info("Upserting %d vectors for %s", len(batch_docs), file_path)
+            embed_batch_elapsed = time.time() - embed_batch_start
+            upsert_batch_start = time.time()
             store.upsert(
                 ids=batch_ids,
                 documents=batch_docs,
                 embeddings=batch_vecs,
                 metadatas=batch_meta,
             )
+            upsert_batch_elapsed = time.time() - upsert_batch_start
+            upsert_total_time += upsert_batch_elapsed
+            batch_elapsed = time.time() - batch_start
+            logger.info(
+                "  [BATCH %d] Done (total=%.2fs | embed=%.2fs | upsert=%.2fs)",
+                batch_count,
+                batch_elapsed,
+                embed_batch_elapsed,
+                upsert_batch_elapsed,
+            )
+        
+        embed_elapsed = time.time() - embed_start_time
+        file_elapsed = time.time() - file_start_time
+        logger.info(
+            "[FILE_SUMMARY] %d chunks processed in %.2fs (embedding: %.2fs | upsert: %.2fs)\n",
+            len(texts),
+            file_elapsed,
+            embed_elapsed,
+            upsert_total_time
+        )
 
+    index_elapsed = time.time() - index_start_time
     logger.info(
-        "Indexing complete: files_seen=%d files_indexed=%d chunks=%d",
+        "=" * 80
+    )
+    logger.info(
+        "INDEXING COMPLETE | files_seen=%d | files_indexed=%d | chunks=%d | elapsed=%.2fs",
         stats.files_seen,
         stats.files_indexed,
         stats.chunks_emitted,
+        index_elapsed,
+    )
+    logger.info(
+        "=" * 80
     )
     return stats

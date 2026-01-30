@@ -35,3 +35,7 @@ def setup_logging(*, log_level: Optional[str] = None, log_file: Optional[str] = 
     root.addHandler(stream_handler)
     root.addHandler(file_handler)
     setattr(root, "_mci_configured", True)
+    
+    # Suppress verbose httpx and other third-party logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
