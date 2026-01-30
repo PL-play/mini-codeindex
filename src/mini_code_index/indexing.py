@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import json
 import hashlib
@@ -18,12 +19,16 @@ from .logging_utils import setup_logging
 logger = logging.getLogger(__name__)
 
 
-def _hash_file_sha256(path: str) -> str:
+def _hash_file_sha256_sync(path: str) -> str:
     hasher = hashlib.sha256()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(8192), b""):
             hasher.update(block)
     return hasher.hexdigest()
+
+
+async def _hash_file_sha256(path: str) -> str:
+    return await asyncio.to_thread(_hash_file_sha256_sync, path)
 
 
 def _new_id() -> str:
@@ -74,7 +79,9 @@ _BINARY_EXTENSIONS = {
 }
 
 
-def _is_probably_text_file(path: str, *, chunk_cfg: ChunkConfig, sample_size: int = 8192) -> bool:
+def _is_probably_text_file_sync(
+    path: str, *, chunk_cfg: ChunkConfig, sample_size: int = 8192
+) -> bool:
     """Heuristic filter to skip binary files.
 
     We keep this simple and fast:
@@ -128,6 +135,14 @@ def _is_probably_text_file(path: str, *, chunk_cfg: ChunkConfig, sample_size: in
         return False
 
     return True
+
+
+async def _is_probably_text_file(
+    path: str, *, chunk_cfg: ChunkConfig, sample_size: int = 8192
+) -> bool:
+    return await asyncio.to_thread(
+        _is_probably_text_file_sync, path, chunk_cfg=chunk_cfg, sample_size=sample_size
+    )
 
 
 @dataclass
@@ -315,13 +330,14 @@ def _expand_chunks(*, chunks: list[Chunk], file_path: str, rel_path: str) -> lis
     return expanded
 
 
-def _prepare_chunks_for_file(
+def _prepare_chunks_for_file_sync(
     *,
     file_path: str,
     rel_path: str,
     file_sha256: str,
-    chunker: TreeSitterChunker,
+    chunk_cfg: ChunkConfig,
 ) -> list[tuple[Chunk, str]]:
+    chunker = TreeSitterChunker(chunk_cfg)
     chunks: List[Chunk] = list(chunker.chunk(file_path))
     if not chunks:
         return []
@@ -331,6 +347,22 @@ def _prepare_chunks_for_file(
         c.sha256 = file_sha256
 
     return _expand_chunks(chunks=chunks, file_path=file_path, rel_path=rel_path)
+
+
+async def _prepare_chunks_for_file(
+    *,
+    file_path: str,
+    rel_path: str,
+    file_sha256: str,
+    chunk_cfg: ChunkConfig,
+) -> list[tuple[Chunk, str]]:
+    return await asyncio.to_thread(
+        _prepare_chunks_for_file_sync,
+        file_path=file_path,
+        rel_path=rel_path,
+        file_sha256=file_sha256,
+        chunk_cfg=chunk_cfg,
+    )
 
 
 def _build_upsert_payloads(
@@ -356,7 +388,7 @@ def _build_upsert_payloads(
     return texts, ids, metadatas
 
 
-def index_directory(
+async def index_directory(
     *,
     cfg: IndexConfig,
     chunk_cfg: Optional[ChunkConfig] = None,
@@ -364,6 +396,7 @@ def index_directory(
     store: Optional[VectorStore] = None,
     force_upsert: bool = False,
     batch_size: int = 16,
+    max_concurrency: int = 4,
 ) -> IndexStats:
     """Index a directory end-to-end (scan -> chunk -> embed -> write).
 
@@ -375,12 +408,9 @@ def index_directory(
     setup_logging()
     stats = IndexStats()
     chunk_cfg = chunk_cfg or ChunkConfig()
-    chunker = TreeSitterChunker(chunk_cfg)
 
     index_start_time = time.time()
-    logger.info(
-        "=" * 80
-    )
+    logger.info("=" * 80)
     logger.info(
         "INDEXING START: root=%s | mode=%s | chunk_size=%s | overlap=%s | dry_run=%s",
         cfg.root_dir,
@@ -393,179 +423,200 @@ def index_directory(
     if not cfg.dry_run and store is None:
         raise ValueError("store is required when dry_run=False")
 
-    # We allow embedder=None for a pure chunking dry-run.
-    
-    for file_path in iter_candidate_files(cfg):
-        stats.files_seen += 1
-        logger.debug("Scanning file: %s", file_path)
+    file_paths = list(iter_candidate_files(cfg))
+    stats.files_seen = len(file_paths)
 
-        # Default behaviour: skip non-text/binary files (images, archives, etc).
-        if not _is_probably_text_file(file_path, chunk_cfg=chunk_cfg):
-            logger.debug("Skipping non-text file: %s", file_path)
-            continue
+    semaphore = asyncio.Semaphore(max_concurrency)
+    store_lock = asyncio.Lock()
 
-        try:
-            file_sha256 = _hash_file_sha256(file_path)
-        except OSError:
-            continue
+    async def _process_file(file_path: str) -> tuple[int, int]:
+        async with semaphore:
+            logger.debug("Scanning file: %s", file_path)
 
-        rel_path = os.path.relpath(file_path, cfg.root_dir).replace(os.sep, "/")
-        file_start_time = time.time()
-        logger.info(
-            "---\n[FILE] Processing: %s", file_path
-        )
+            if not await _is_probably_text_file(file_path, chunk_cfg=chunk_cfg):
+                logger.debug("Skipping non-text file: %s", file_path)
+                return 0, 0
 
-        if not cfg.dry_run:
-            if embedder is None:
-                raise ValueError("embedder is required when dry_run=False")
-            assert store is not None
+            try:
+                file_sha256 = await _hash_file_sha256(file_path)
+            except OSError:
+                return 0, 0
 
-            existing = store.get_one_by_path(path=file_path)
-            existing_sha = existing.get("sha256") if isinstance(existing, dict) else None
+            rel_path = os.path.relpath(file_path, cfg.root_dir).replace(os.sep, "/")
+            file_start_time = time.time()
+            logger.info("---\n[FILE] Processing: %s", file_path)
 
-            if not force_upsert and existing_sha == file_sha256 and existing is not None:
+            if not cfg.dry_run:
+                if embedder is None:
+                    raise ValueError("embedder is required when dry_run=False")
+                assert store is not None
+
+                async with store_lock:
+                    existing = await store.get_one_by_path(path=file_path)
+                existing_sha = existing.get("sha256") if isinstance(existing, dict) else None
+
+                if not force_upsert and existing_sha == file_sha256 and existing is not None:
+                    file_elapsed = time.time() - file_start_time
+                    logger.info(
+                        "[SKIP] Unchanged (sha256 match). elapsed=%.2fs\n",
+                        file_elapsed,
+                    )
+                    return 0, 0
+
+                if existing is not None:
+                    async with store_lock:
+                        await store.delete_by_path(path=file_path)
+                    if force_upsert and existing_sha == file_sha256:
+                        logger.info(
+                            "[UPDATE] Force reindex: deleted existing vectors for: %s",
+                            file_path,
+                        )
+                    else:
+                        logger.info("[UPDATE] Deleted existing vectors for: %s", file_path)
+                else:
+                    logger.info("[UPDATE] No existing vectors found for: %s", file_path)
+
+            expanded_chunks = await _prepare_chunks_for_file(
+                file_path=file_path,
+                rel_path=rel_path,
+                file_sha256=file_sha256,
+                chunk_cfg=chunk_cfg,
+            )
+            if not expanded_chunks:
+                logger.debug("No chunks emitted for: %s", file_path)
+                return 0, 0
+
+            base_chunks = sum(1 for _, kind in expanded_chunks if kind == "code")
+            expanded_total = len(expanded_chunks)
+            expansion_ratio = (expanded_total / base_chunks) if base_chunks else 0.0
+            chunk_lengths = [len(c.text) for c, _ in expanded_chunks]
+            total_chars = sum(chunk_lengths)
+            min_chars = min(chunk_lengths) if chunk_lengths else 0
+            max_chars = max(chunk_lengths) if chunk_lengths else 0
+            avg_chars = int(total_chars / expanded_total) if expanded_total else 0
+            logger.info(
+                "[CHUNKING] base=%d expanded=%d ratio=%.2f chars(min/avg/max)=%d/%d/%d",
+                base_chunks,
+                expanded_total,
+                expansion_ratio,
+                min_chars,
+                avg_chars,
+                max_chars,
+            )
+
+            chunk_types_count = {}
+            chunk_kind_lengths: dict[str, list[int]] = {}
+            for chunk, chunk_kind in expanded_chunks:
+                chunk_types_count[chunk_kind] = chunk_types_count.get(chunk_kind, 0) + 1
+                chunk_kind_lengths.setdefault(chunk_kind, []).append(len(chunk.text))
+
+            chunk_type_str = ", ".join(
+                [f"{k}={v}" for k, v in sorted(chunk_types_count.items())]
+            )
+            logger.info(
+                "[CHUNKING] Chunks emitted: %d total | Types: %s",
+                len(expanded_chunks),
+                chunk_type_str,
+            )
+            for kind, lengths in sorted(chunk_kind_lengths.items()):
+                if not lengths:
+                    continue
+                kind_min = min(lengths)
+                kind_max = max(lengths)
+                kind_avg = int(sum(lengths) / len(lengths))
+                logger.info(
+                    "[CHUNKING] kind=%s count=%d chars(min/avg/max)=%d/%d/%d",
+                    kind,
+                    len(lengths),
+                    kind_min,
+                    kind_avg,
+                    kind_max,
+                )
+
+            if cfg.dry_run:
                 file_elapsed = time.time() - file_start_time
                 logger.info(
-                    "[SKIP] Unchanged (sha256 match). elapsed=%.2fs\n",
+                    "[DRY_RUN] Skipping embedding and upserting (elapsed: %.2fs)\n",
                     file_elapsed,
                 )
-                continue
+                return 1, len(expanded_chunks)
 
-            if existing is not None:
-                store.delete_by_path(path=file_path)
-                if force_upsert and existing_sha == file_sha256:
-                    logger.info("[UPDATE] Force reindex: deleted existing vectors for: %s", file_path)
-                else:
-                    logger.info("[UPDATE] Deleted existing vectors for: %s", file_path)
-            else:
-                logger.info("[UPDATE] No existing vectors found for: %s", file_path)
-        expanded_chunks = _prepare_chunks_for_file(
-            file_path=file_path,
-            rel_path=rel_path,
-            file_sha256=file_sha256,
-            chunker=chunker,
-        )
-        if not expanded_chunks:
-            logger.debug("No chunks emitted for: %s", file_path)
-            continue
-
-        base_chunks = sum(1 for _, kind in expanded_chunks if kind == "code")
-        expanded_total = len(expanded_chunks)
-        expansion_ratio = (expanded_total / base_chunks) if base_chunks else 0.0
-        chunk_lengths = [len(c.text) for c, _ in expanded_chunks]
-        total_chars = sum(chunk_lengths)
-        min_chars = min(chunk_lengths) if chunk_lengths else 0
-        max_chars = max(chunk_lengths) if chunk_lengths else 0
-        avg_chars = int(total_chars / expanded_total) if expanded_total else 0
-        logger.info(
-            "[CHUNKING] base=%d expanded=%d ratio=%.2f chars(min/avg/max)=%d/%d/%d",
-            base_chunks,
-            expanded_total,
-            expansion_ratio,
-            min_chars,
-            avg_chars,
-            max_chars,
-        )
-
-        # Analyze chunk types for better visibility
-        chunk_types_count = {}
-        chunk_kind_lengths: dict[str, list[int]] = {}
-        for chunk, chunk_kind in expanded_chunks:
-            chunk_types_count[chunk_kind] = chunk_types_count.get(chunk_kind, 0) + 1
-            chunk_kind_lengths.setdefault(chunk_kind, []).append(len(chunk.text))
-        
-        chunk_type_str = ", ".join([f"{k}={v}" for k, v in sorted(chunk_types_count.items())])
-        logger.info(
-            "[CHUNKING] Chunks emitted: %d total | Types: %s", 
-            len(expanded_chunks),
-            chunk_type_str
-        )
-        for kind, lengths in sorted(chunk_kind_lengths.items()):
-            if not lengths:
-                continue
-            kind_min = min(lengths)
-            kind_max = max(lengths)
-            kind_avg = int(sum(lengths) / len(lengths))
-            logger.info(
-                "[CHUNKING] kind=%s count=%d chars(min/avg/max)=%d/%d/%d",
-                kind,
-                len(lengths),
-                kind_min,
-                kind_avg,
-                kind_max,
+            embed_start_time = time.time()
+            upsert_total_time = 0.0
+            texts, ids, metadatas = _build_upsert_payloads(
+                expanded_chunks=expanded_chunks,
+                file_path=file_path,
+                file_sha256=file_sha256,
+                rel_path=rel_path,
             )
+            logger.info("[EMBEDDING] Processing %d chunks...", len(texts))
 
-        stats.files_indexed += 1
-        stats.chunks_emitted += len(expanded_chunks)
+            batch_count = 0
+            for i in range(0, len(texts), batch_size):
+                batch_count += 1
+                batch_docs = texts[i : i + batch_size]
+                batch_ids = ids[i : i + batch_size]
+                batch_meta = metadatas[i : i + batch_size]
+                batch_start = time.time()
 
-        if cfg.dry_run:
+                logger.info(
+                    "  [BATCH %d/%d] Embedding and upserting: items [%d-%d] (%d chunks)",
+                    batch_count,
+                    (len(texts) + batch_size - 1) // batch_size,
+                    i,
+                    min(i + batch_size, len(texts)) - 1,
+                    len(batch_docs),
+                )
+                embed_batch_start = time.time()
+                batch_vecs = await embedder.embed(batch_docs)
+                embed_batch_elapsed = time.time() - embed_batch_start
+                upsert_batch_start = time.time()
+                async with store_lock:
+                    await store.upsert(
+                        ids=batch_ids,
+                        documents=batch_docs,
+                        embeddings=batch_vecs,
+                        metadatas=batch_meta,
+                    )
+                upsert_batch_elapsed = time.time() - upsert_batch_start
+                upsert_total_time += upsert_batch_elapsed
+                batch_elapsed = time.time() - batch_start
+                logger.info(
+                    "  [BATCH %d] Done (total=%.2fs | embed=%.2fs | upsert=%.2fs)",
+                    batch_count,
+                    batch_elapsed,
+                    embed_batch_elapsed,
+                    upsert_batch_elapsed,
+                )
+
+            embed_elapsed = time.time() - embed_start_time
             file_elapsed = time.time() - file_start_time
-            logger.info("[DRY_RUN] Skipping embedding and upserting (elapsed: %.2fs)\n", file_elapsed)
-            continue
-
-        # Batch embed + upsert. This is the main shape; we will refine metadata
-        # and update strategy (delete-by-path vs stable IDs) later.
-        embed_start_time = time.time()
-        upsert_total_time = 0.0
-        texts, ids, metadatas = _build_upsert_payloads(
-            expanded_chunks=expanded_chunks,
-            file_path=file_path,
-            file_sha256=file_sha256,
-            rel_path=rel_path,
-        )
-        logger.info("[EMBEDDING] Processing %d chunks...", len(texts))
-
-        batch_count = 0
-        for i in range(0, len(texts), batch_size):
-            batch_count += 1
-            batch_docs = texts[i : i + batch_size]
-            batch_ids = ids[i : i + batch_size]
-            batch_meta = metadatas[i : i + batch_size]
-            batch_start = time.time()
-            
             logger.info(
-                "  [BATCH %d/%d] Embedding and upserting: items [%d-%d] (%d chunks)",
-                batch_count,
-                (len(texts) + batch_size - 1) // batch_size,
-                i,
-                min(i + batch_size, len(texts)) - 1,
-                len(batch_docs),
+                "[FILE_SUMMARY] %d chunks processed in %.2fs (embedding: %.2fs | upsert: %.2fs)\n",
+                len(texts),
+                file_elapsed,
+                embed_elapsed,
+                upsert_total_time,
             )
-            embed_batch_start = time.time()
-            batch_vecs = embedder.embed(batch_docs)
-            embed_batch_elapsed = time.time() - embed_batch_start
-            upsert_batch_start = time.time()
-            store.upsert(
-                ids=batch_ids,
-                documents=batch_docs,
-                embeddings=batch_vecs,
-                metadatas=batch_meta,
-            )
-            upsert_batch_elapsed = time.time() - upsert_batch_start
-            upsert_total_time += upsert_batch_elapsed
-            batch_elapsed = time.time() - batch_start
-            logger.info(
-                "  [BATCH %d] Done (total=%.2fs | embed=%.2fs | upsert=%.2fs)",
-                batch_count,
-                batch_elapsed,
-                embed_batch_elapsed,
-                upsert_batch_elapsed,
-            )
-        
-        embed_elapsed = time.time() - embed_start_time
-        file_elapsed = time.time() - file_start_time
-        logger.info(
-            "[FILE_SUMMARY] %d chunks processed in %.2fs (embedding: %.2fs | upsert: %.2fs)\n",
-            len(texts),
-            file_elapsed,
-            embed_elapsed,
-            upsert_total_time
+            return 1, len(expanded_chunks)
+
+    try:
+        results = await asyncio.gather(
+            *[asyncio.create_task(_process_file(p)) for p in file_paths]
         )
+        for files_indexed_inc, chunks_emitted_inc in results:
+            stats.files_indexed += files_indexed_inc
+            stats.chunks_emitted += chunks_emitted_inc
+    finally:
+        if embedder is not None and hasattr(embedder, "close"):
+            close_fn = getattr(embedder, "close")
+            if asyncio.iscoroutinefunction(close_fn):
+                await close_fn()
+            else:
+                close_fn()
 
     index_elapsed = time.time() - index_start_time
-    logger.info(
-        "=" * 80
-    )
+    logger.info("=" * 80)
     logger.info(
         "INDEXING COMPLETE | files_seen=%d | files_indexed=%d | chunks=%d | elapsed=%.2fs",
         stats.files_seen,
@@ -573,7 +624,5 @@ def index_directory(
         stats.chunks_emitted,
         index_elapsed,
     )
-    logger.info(
-        "=" * 80
-    )
+    logger.info("=" * 80)
     return stats

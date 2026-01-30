@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 from typing import Sequence, Mapping, Any, Optional
@@ -25,7 +26,7 @@ def _load_dotenv(path: str) -> None:
 
 
 class DummyEmbedder(Embedder):
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         return [[0.0] for _ in texts]
 
 
@@ -34,19 +35,19 @@ class CaptureStore(VectorStore):
         self.deleted_paths: list[str] = []
         self.upserts: list[dict[str, Any]] = []
 
-    def ping(self) -> bool:  # pragma: nocover - not used in tests
+    async def ping(self) -> bool:  # pragma: nocover - not used in tests
         return True
 
-    def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]:
+    async def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]:
         return None
 
-    def delete_by_path(self, *, path: str) -> None:
+    async def delete_by_path(self, *, path: str) -> None:
         self.deleted_paths.append(path)
 
     def get_upserts(self, path: str) -> list[dict[str, Any]]:
         return self.upserts
 
-    def upsert(
+    async def upsert(
             self,
             *,
             ids: Sequence[str],
@@ -111,7 +112,9 @@ def test_index_directory_smoke(tmp_path) -> None:
     # For real writes, uncomment and set cfg.dry_run=False:
     # embedder = OpenAICompatibleEmbedder.from_env()
 
-    stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    stats = asyncio.run(
+        index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    )
     print(stats)
 
 
@@ -234,7 +237,9 @@ def test_index_directory_no_error() -> None:
     store = CaptureStore()
     embedder = DummyEmbedder()
 
-    stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    stats = asyncio.run(
+        index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    )
     print(stats)
 
 
@@ -276,6 +281,14 @@ def test_full_pipeline_with_real_services() -> None:
     )
 
     store = ChromaStore(base_url=chroma_host, root_dir=str(test_project_dir))
-    stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store, force_upsert=True,
-                            batch_size=128)
+    stats = asyncio.run(
+        index_directory(
+            cfg=cfg,
+            chunk_cfg=chunk_cfg,
+            embedder=embedder,
+            store=store,
+            force_upsert=True,
+            batch_size=128,
+        )
+    )
     print(stats)

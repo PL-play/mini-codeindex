@@ -8,6 +8,7 @@ dependencies = [
   "charset-normalizer>=3.4",
   "tree-sitter>=0.22",
   "tree-sitter-language-pack>=0.6",
+  "aiohttp>=3.9",
 ]
 
 [project.scripts]

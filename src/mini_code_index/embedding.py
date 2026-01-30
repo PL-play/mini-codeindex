@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Protocol, Sequence
 
+import aiohttp
 import logging
 
 
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class Embedder(Protocol):
-    def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 
 
 # Approximate token estimation: ~4 characters per token for English.
@@ -121,6 +121,7 @@ class OpenAICompatibleEmbedder:
     token_limit: Optional[int] = None
     max_retries: int = 3
     retry_delay_s: float = 1.0
+    _session: Optional[aiohttp.ClientSession] = None
 
     @classmethod
     def from_env(cls) -> "OpenAICompatibleEmbedder":
@@ -168,6 +169,24 @@ class OpenAICompatibleEmbedder:
             retry_delay_s=retry_delay_s,
         )
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=self.timeout_s)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+    async def __aenter__(self) -> "OpenAICompatibleEmbedder":
+        await self._get_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
     def _embeddings_url(self) -> str:
         """Build embeddings endpoint for OpenAI-compatible APIs.
 
@@ -181,7 +200,7 @@ class OpenAICompatibleEmbedder:
             return root + "/embeddings"
         return root + "/v1/embeddings"
 
-    def _request(self, inputs: Sequence[str]) -> dict[str, Any]:
+    async def _request(self, inputs: Sequence[str]) -> dict[str, Any]:
         url = self._embeddings_url()
 
         # OpenRouter docs accept either a string input or a list input.
@@ -194,61 +213,84 @@ class OpenAICompatibleEmbedder:
         if self.dimensions is not None:
             body["dimensions"] = int(self.dimensions)
 
-        req = urllib.request.Request(
-            url=url,
-            method="POST",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-        )
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                    raw = resp.read().decode("utf-8")
-                break
-            except urllib.error.HTTPError as e:
-                last_error = e
-                # Handle 429 + 5xx with backoff; other 4xx are treated as fatal.
-                detail = ""
-                try:
-                    detail = e.read().decode("utf-8")
-                except Exception:
-                    pass
+                session = await self._get_session()
+                async with session.post(url, json=body, headers=headers) as resp:
+                    raw = await resp.text()
 
-                if e.code == 429:
-                    retry_after = None
-                    try:
-                        ra = e.headers.get("Retry-After") if e.headers else None
-                        retry_after = float(ra) if ra else None
-                    except Exception:
+                    if resp.status == 429:
                         retry_after = None
-                    delay = retry_after if retry_after is not None else self.retry_delay_s * (2**attempt)
-                    time.sleep(delay)
-                    continue
-                if 500 <= e.code < 600:
-                    delay = self.retry_delay_s * (2**attempt)
-                    time.sleep(delay)
-                    continue
+                        try:
+                            ra = resp.headers.get("Retry-After") if resp.headers else None
+                            retry_after = float(ra) if ra else None
+                        except Exception:
+                            retry_after = None
+                        delay = (
+                            retry_after
+                            if retry_after is not None
+                            else self.retry_delay_s * (2**attempt)
+                        )
+                        logger.warning(
+                            "Embeddings HTTP 429. Retry %d/%d in %.2fs",
+                            attempt + 1,
+                            self.max_retries,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
 
-                raise EmbeddingError(f"Embeddings HTTP error: {e.code} {e.reason} {detail}") from e
-            except urllib.error.URLError as e:
+                    if 500 <= resp.status < 600:
+                        delay = self.retry_delay_s * (2**attempt)
+                        logger.warning(
+                            "Embeddings HTTP %d. Retry %d/%d in %.2fs",
+                            resp.status,
+                            attempt + 1,
+                            self.max_retries,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    if resp.status >= 400:
+                        raise EmbeddingError(
+                            f"Embeddings HTTP error: {resp.status} {resp.reason} {raw}"
+                        )
+
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError as e:
+                        raise EmbeddingError("Embeddings response is not valid JSON") from e
+
+                    if isinstance(payload, dict) and payload.get("error"):
+                        err = payload.get("error") or {}
+                        code = err.get("code", "unknown")
+                        message = err.get("message", "unknown error")
+                        raise EmbeddingError(f"Embeddings API error: {code} {message}")
+
+                    return payload
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
                 last_error = e
                 delay = self.retry_delay_s * (2**attempt)
-                time.sleep(delay)
+                logger.warning(
+                    "Embeddings connection error: %s. Retry %d/%d in %.2fs",
+                    e,
+                    attempt + 1,
+                    self.max_retries,
+                    delay,
+                )
+                await asyncio.sleep(delay)
                 continue
         else:
             raise EmbeddingError(f"Embeddings request failed after {self.max_retries} retries: {last_error}")
 
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise EmbeddingError("Embeddings response is not valid JSON") from e
-
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
 
@@ -300,7 +342,7 @@ class OpenAICompatibleEmbedder:
                 self.model,
             )
             req_start = time.time()
-            payload = self._request(batch)
+            payload = await self._request(batch)
             req_elapsed = time.time() - req_start
             logger.debug("    [BATCH %d] API request completed (%.2fs)", batch_num, req_elapsed)
             batch_vectors = _parse_openai_embeddings_response(payload, n_expected=len(batch))

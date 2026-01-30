@@ -1,3 +1,4 @@
+import asyncio
 import math
 import os
 
@@ -35,7 +36,7 @@ def _print_vec_preview(idx: int, text: str, vec: list[float]) -> None:
     print(f"    vec_first8= [{v_preview}]")
 
 
-def _run_case(
+async def _run_case(
     *,
     title: str,
     embedder: OpenAICompatibleEmbedder,
@@ -43,7 +44,7 @@ def _run_case(
     positives: list[tuple[int, int]],
     negatives: list[tuple[int, int]],
 ) -> None:
-    vecs = embedder.embed(texts)
+    vecs = await embedder.embed(texts)
     print("\n===", title, "===")
     print("model=", embedder.model)
     print("base_url=", embedder.base_url)
@@ -82,12 +83,14 @@ def test_embed_nl_baseline_paraphrase_vs_unrelated() -> None:
         "A method that sums two numbers.",
         "How to cook pasta al dente?",
     ]
-    _run_case(
-        title="NL baseline: paraphrase vs unrelated",
-        embedder=embedder,
-        texts=texts,
-        positives=[(0, 1)],
-        negatives=[(0, 2)],
+    asyncio.run(
+        _run_case(
+            title="NL baseline: paraphrase vs unrelated",
+            embedder=embedder,
+            texts=texts,
+            positives=[(0, 1)],
+            negatives=[(0, 2)],
+        )
     )
 
 
@@ -105,12 +108,14 @@ def test_embed_python_short_code_docstring_and_query() -> None:
     py_summary = "Python function add(a, b) returns a + b. Adds two integers."
     py_query = "Where is the function that adds two integers?"
     unrelated = "How to implement quicksort in Python?"
-    _run_case(
-        title="Python: code + summary + query (short)",
-        embedder=embedder,
-        texts=[py_code, py_summary, py_query, unrelated],
-        positives=[(0, 1), (0, 2)],
-        negatives=[(0, 3)],
+    asyncio.run(
+        _run_case(
+            title="Python: code + summary + query (short)",
+            embedder=embedder,
+            texts=[py_code, py_summary, py_query, unrelated],
+            positives=[(0, 1), (0, 2)],
+            negatives=[(0, 3)],
+        )
     )
 
 
@@ -144,12 +149,14 @@ def test_embed_python_longer_code_with_comments_and_summary() -> None:
     )
     query = "Find the code that computes cosine similarity between vectors."
     negative = "Python code that reads a JSON file from disk and parses it."
-    _run_case(
-        title="Python: longer code + summary + query",
-        embedder=embedder,
-        texts=[py_code, summary, query, negative],
-        positives=[(0, 1), (0, 2)],
-        negatives=[(0, 3)],
+    asyncio.run(
+        _run_case(
+            title="Python: longer code + summary + query",
+            embedder=embedder,
+            texts=[py_code, summary, query, negative],
+            positives=[(0, 1), (0, 2)],
+            negatives=[(0, 3)],
+        )
     )
 
 
@@ -174,12 +181,14 @@ def test_embed_java_code_comment_and_query() -> None:
     java_summary = "Java utility class MathUtil with static add(a,b) that returns the sum of two integers."
     java_query = "Find the Java method that adds two numbers and returns the sum."
     java_unrelated = "Java method that parses JSON string into an object."
-    _run_case(
-        title="Java: code + summary + query",
-        embedder=embedder,
-        texts=[java_code, java_summary, java_query, java_unrelated],
-        positives=[(0, 1), (0, 2)],
-        negatives=[(0, 3)],
+    asyncio.run(
+        _run_case(
+            title="Java: code + summary + query",
+            embedder=embedder,
+            texts=[java_code, java_summary, java_query, java_unrelated],
+            positives=[(0, 1), (0, 2)],
+            negatives=[(0, 3)],
+        )
     )
 
 
@@ -201,7 +210,7 @@ def test_embed_cross_language_queries_against_code() -> None:
     )
 
     texts = [query_en, query_zh, py_code, java_code, unrelated_code]
-    vecs = embedder.embed(texts)
+    vecs = asyncio.run(embedder.embed(texts))
 
     print("\n=== Cross-language queries ===")
     print("model=", embedder.model)

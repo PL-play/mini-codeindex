@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 
@@ -59,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "ping":
         store = ChromaStore(base_url=args.chroma_url)
-        ok = store.ping()
+        ok = asyncio.run(store.ping())
         print("ok" if ok else "failed")
         return 0 if ok else 1
 
@@ -68,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = IndexConfig(root_dir=args.root, dry_run=not args.write)
 
         store = ChromaStore(base_url=args.chroma_url, root_dir=args.root)
-        if not store.ping():
+        if not asyncio.run(store.ping()):
             print(f"ChromaDB is not reachable at {args.chroma_url}", file=sys.stderr)
             return 2
 
@@ -76,7 +77,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.write:
             embedder = OpenAICompatibleEmbedder.from_env()
 
-        stats = index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+        stats = asyncio.run(
+            index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+        )
         print(
             f"files_seen={stats.files_seen} files_indexed={stats.files_indexed} chunks={stats.chunks_emitted} dry_run={cfg.dry_run}"
         )

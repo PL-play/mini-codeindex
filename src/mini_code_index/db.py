@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import socket
@@ -21,13 +22,13 @@ class VectorStore(Protocol):
     call into a backend without committing to Chroma's Python client yet.
     """
 
-    def ping(self) -> bool: ...
+    async def ping(self) -> bool: ...
 
-    def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]: ...
+    async def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]: ...
 
-    def delete_by_path(self, *, path: str) -> None: ...
+    async def delete_by_path(self, *, path: str) -> None: ...
 
-    def upsert(
+    async def upsert(
         self,
         *,
         ids: Sequence[str],
@@ -67,7 +68,10 @@ class ChromaStore(VectorStore):
         root = self.base_url.rstrip("/")
         return [f"{root}/api/v2/heartbeat", f"{root}/api/v1/heartbeat"]
 
-    def ping(self) -> bool:
+    async def ping(self) -> bool:
+        return await asyncio.to_thread(self._ping_sync)
+
+    def _ping_sync(self) -> bool:
         for url in self._heartbeat_urls():
             try:
                 req = urllib.request.Request(url, method="GET")
@@ -122,7 +126,10 @@ class ChromaStore(VectorStore):
         self._collection = client.get_or_create_collection(name=name, metadata=meta)
         return self._collection
 
-    def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]:
+    async def get_one_by_path(self, *, path: str) -> Optional[Mapping[str, Any]]:
+        return await asyncio.to_thread(self._get_one_by_path_sync, path)
+
+    def _get_one_by_path_sync(self, path: str) -> Optional[Mapping[str, Any]]:
         collection = self._ensure_collection()
         full = os.path.abspath(os.path.expanduser(path))
         try:
@@ -135,14 +142,32 @@ class ChromaStore(VectorStore):
             return None
         return metadatas[0]
 
-    def delete_by_path(self, *, path: str) -> None:
+    async def delete_by_path(self, *, path: str) -> None:
+        await asyncio.to_thread(self._delete_by_path_sync, path)
+
+    def _delete_by_path_sync(self, path: str) -> None:
         collection = self._ensure_collection()
         full = os.path.abspath(os.path.expanduser(path))
         collection.delete(where={"path": full})
 
-    def upsert(
+    async def upsert(
         self,
         *,
+        ids: Sequence[str],
+        documents: Sequence[str],
+        embeddings: Sequence[Sequence[float]],
+        metadatas: Sequence[Mapping[str, Any]],
+    ) -> None:
+        await asyncio.to_thread(
+            self._upsert_sync,
+            ids,
+            documents,
+            embeddings,
+            metadatas,
+        )
+
+    def _upsert_sync(
+        self,
         ids: Sequence[str],
         documents: Sequence[str],
         embeddings: Sequence[Sequence[float]],
