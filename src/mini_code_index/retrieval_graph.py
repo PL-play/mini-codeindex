@@ -93,7 +93,8 @@ async def rewrite_query_node(state: GraphState) -> Command:
     if raw_text:
         try:
             data = json.loads(raw_text)
-        except Exception:
+        except Exception as e:
+            logger.error(e)
             data = None
 
     if not isinstance(data, list):
@@ -106,7 +107,6 @@ async def rewrite_query_node(state: GraphState) -> Command:
             }
         )
 
-    rewritten: List[str] = []
     rewritten = [str(s).strip() for s in data if str(s).strip()]
     if not rewritten:
         rewritten = [query]
