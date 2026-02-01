@@ -2,15 +2,19 @@ import asyncio
 import os
 import random
 from typing import Sequence, Mapping, Any, Optional
+from urllib.parse import urlparse
+from urllib.parse import urlparse
 
 import pytest
 
 from mini_code_index.chunking import Config as ChunkConfig, TreeSitterChunker, format_scope
-from mini_code_index.db import ChromaStore, VectorStore
+from mini_code_index.db import ChromaStore, VectorStore, _collection_name_for_root
 from mini_code_index.embedding import OpenAICompatibleEmbedder, Embedder
 from mini_code_index.indexing import IndexConfig, index_directory, iter_candidate_files
 
+from dotenv import load_dotenv
 
+load_dotenv()
 def _load_dotenv(path: str) -> None:
     if not os.path.isfile(path):
         return
@@ -292,3 +296,40 @@ def test_full_pipeline_with_real_services() -> None:
         )
     )
     print(stats)
+
+
+@pytest.mark.integration
+def test_chromadb_query_smoke() -> None:
+    """Smoke test for querying ChromaDB using real embeddings."""
+    chroma_host = os.environ.get("CHROMADB_HOST")
+    if not chroma_host:
+        pytest.skip("CHROMADB_HOST not set")
+
+    try:
+        import chromadb
+    except Exception as e:
+        pytest.skip(f"chromadb not available: {e}")
+
+    try:
+        embedder = OpenAICompatibleEmbedder.from_env()
+    except Exception as e:
+        pytest.skip(f"Embedder config missing: {e}")
+
+    parsed = urlparse(chroma_host)
+    client = chromadb.HttpClient(host=parsed.hostname, port=parsed.port)
+
+    root_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
+    collection_name = _collection_name_for_root(root_dir)
+    try:
+        collection = client.get_collection(collection_name)
+    except Exception as e:
+        pytest.skip(f"Collection not found: {e}")
+
+    query = "message notification"
+    embedding = asyncio.run(embedder.embed([query]))[0]
+    results = collection.query(
+        query_embeddings=[embedding],
+        n_results=5,
+    )
+    print(results)
+    assert results is not None
