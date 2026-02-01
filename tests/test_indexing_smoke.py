@@ -325,11 +325,16 @@ def test_chromadb_query_smoke() -> None:
     except Exception as e:
         pytest.skip(f"Collection not found: {e}")
 
-    query = "message notification"
-    embedding = asyncio.run(embedder.embed([query]))[0]
-    results = collection.query(
-        query_embeddings=[embedding],
-        n_results=5,
-    )
+    async def _run_query() -> Any:
+        query = "加密"
+        async with embedder:
+            embedding = (await embedder.embed([query]))[0]
+            results = collection.query(
+                query_embeddings=[embedding],
+                n_results=5,
+            )
+            return results
+
+    results = asyncio.run(_run_query())
     print(results)
     assert results is not None
