@@ -3,49 +3,24 @@ from __future__ import annotations
 import json
 import logging
 import os
-from operator import add
-from typing import Annotated, Any, Dict, List, TypedDict
+from typing import Any
 
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
+from mini_code_index.retrieval_defs import (
+    ENV_REWRITE_API_KEY,
+    ENV_REWRITE_BASE_URL,
+    ENV_REWRITE_MODEL,
+    GraphState,
+    REWRITE_SYSTEM_PROMPT,
+)
 from utils.interface import LLMRequest, OpenAICompatibleChatConfig
 from utils.llm_factory import OpenAICompatibleChatLLMService
 from utils.llm_utils import log_llm_json_result
 
 
 logger = logging.getLogger(__name__)
-
-
-class GraphState(TypedDict):
-    """State for retrieval graph nodes."""
-
-    query: str  # Original user query
-    rewrite: Dict[str, Any]  # Raw structured rewrite payload
-    rewritten_queries: Annotated[List[str], add]  # Accumulator across nodes
-    notes: str  # Status or debug notes
-
-
-REWRITE_SCHEMA = 'Return JSON only (no markdown, no extra text). Output MUST be: ["q1", "q2", ...]'
-
-REWRITE_SYSTEM_PROMPT = (
-    "You are a query rewriting assistant for code search. Split the user's query into\n"
-    "1-5 short, concrete sub-queries for embedding + retrieval. If the query is atomic,\n"
-    "return a single-item list with the original query.\n\n"
-    "Examples:\n"
-    'User: "如何在检索阶段做去重和 rerank，同时保持 chunk 的行号？"\n'
-    'Output: ["检索 去重", "rerank 重排", "chunk 行号 元数据"]\n'
-    'User: "vector store 查询、过滤 path、限制结果数"\n'
-    'Output: ["vector store query", "where path filter", "n_results limit"]\n'
-    'User: "embedding 维度不一致"\n'
-    'Output: ["embedding dims", "dimension mismatch", "truncate embedding dims"]\n\n'
-    f"{REWRITE_SCHEMA}"
-)
-
-
-ENV_REWRITE_BASE_URL = "REWRITE_BASE_URL"
-ENV_REWRITE_API_KEY = "REWRITE_API_KEY"
-ENV_REWRITE_MODEL = "REWRITE_MODEL"
 
 
 async def rewrite_query_node(state: GraphState) -> Command:
@@ -83,12 +58,19 @@ async def rewrite_query_node(state: GraphState) -> Command:
         system_prompt=REWRITE_SYSTEM_PROMPT,
         parse_json=False,
         temperature=0.0,
-        max_tokens=1000,
+        max_tokens=5000,
     )
     resp = await client.complete(req)
     log_llm_json_result(logger, resp, prefix="[rewrite_query]")
 
     raw_text = (resp.raw_text or "").strip()
+    if raw_text.startswith("```"):
+        lines = raw_text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        raw_text = "\n".join(lines).strip()
     data: Any = None
     if raw_text:
         try:
