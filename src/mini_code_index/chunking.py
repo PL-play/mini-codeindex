@@ -4,6 +4,7 @@ import os
 import re
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+import uuid
 from enum import Enum
 from functools import cache
 from io import TextIOWrapper
@@ -74,6 +75,9 @@ class Scope:
     raw_type: Optional[str] = None
     # Optional relative path (used for file scopes).
     rel_path: Optional[str] = None
+    # Tree-sitter scope node positions (1-indexed rows, 0-indexed columns).
+    start: "Point | None" = None
+    end: "Point | None" = None
 
 
 @dataclass
@@ -94,6 +98,13 @@ class Chunk:
     path: Optional[str] = None
     sha256: Optional[str] = None
     language: Optional[str] = None
+    # When a chunk represents (part of) a scoped declaration (function/type),
+    # record the original scope node positions.
+    scope_start: "Point | None" = None
+    scope_end: "Point | None" = None
+    # If a single scope is split into multiple chunks, link them together.
+    group_id: Optional[str] = None
+    group_index: Optional[int] = None
 
     # Full scope path from outermost -> innermost.
     scope_path: list[Scope] = field(default_factory=list)
@@ -121,10 +132,18 @@ def format_chunk_header(chunk: Chunk, idx: Optional[int] = None) -> str:
     prefix = f"[{idx:02d}] " if isinstance(idx, int) else ""
     start = (chunk.start.row, chunk.start.column) if chunk.start else None
     end = (chunk.end.row, chunk.end.column) if chunk.end else None
+    scope_range = None
+    if chunk.scope_start and chunk.scope_end:
+        scope_range = ((chunk.scope_start.row, chunk.scope_start.column), (chunk.scope_end.row, chunk.scope_end.column))
+    group = None
+    if chunk.group_id is not None and chunk.group_index is not None:
+        group = f"{chunk.group_id}:{chunk.group_index}"
     return (
         f"{prefix}{start} -> {end}  chars={len(chunk.text)}  "
         f"scope_path={format_scopes(chunk.scope_path)}  "
         f"contained={format_scopes(chunk.contained_scopes)}"
+        f"{'  scope_range=' + str(scope_range) if scope_range else ''}"
+        f"{'  group=' + str(group) if group else ''}"
     )
 
 
@@ -304,6 +323,15 @@ class TreeSitterChunker:
         with open(path, encoding=encoding) as f:
             return f.read()
 
+    def _attach_scope_range(self, chunk: Chunk) -> Chunk:
+        if (chunk.scope_start is None or chunk.scope_end is None) and chunk.scope_path:
+            last = chunk.scope_path[-1]
+            if chunk.scope_start is None:
+                chunk.scope_start = last.start
+            if chunk.scope_end is None:
+                chunk.scope_end = last.end
+        return chunk
+
     def _scope_of_node(
         self,
         node: "Node",
@@ -325,6 +353,17 @@ class TreeSitterChunker:
             except Exception:
                 return None
 
+        def _scope_range(n: "Node") -> tuple["Point | None", "Point | None"]:
+            try:
+                sp = n.start_point
+                ep = n.end_point
+                return (
+                    Point(row=sp.row + 1, column=sp.column),  # type: ignore
+                    Point(row=ep.row + 1, column=ep.column),  # type: ignore
+                )
+            except Exception:
+                return None, None
+
         def _name_from_field() -> Optional[str]:
             name_node = node.child_by_field_name("name")  # type: ignore[attr-defined]
             if name_node is None:
@@ -344,13 +383,17 @@ class TreeSitterChunker:
         if lang == "python":
             if t == "class_definition":
                 n = _get_name()
-                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=str(t)) if n else None
+                if not n:
+                    return None
+                s, e = _scope_range(node)
+                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=str(t), start=s, end=e)
             if t in {"function_definition", "async_function_definition"}:
                 n = _get_name()
                 if not n:
                     return None
                 # Methods are also functions for our mode="function" purposes.
-                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=str(t))
+                s, e = _scope_range(node)
+                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=str(t), start=s, end=e)
 
         if lang == "java":
             if t in {
@@ -360,10 +403,16 @@ class TreeSitterChunker:
                 "record_declaration",
             }:
                 n = _get_name()
-                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=str(t)) if n else None
+                if not n:
+                    return None
+                s, e = _scope_range(node)
+                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=str(t), start=s, end=e)
             if t in {"method_declaration", "constructor_declaration"}:
                 n = _get_name()
-                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=str(t)) if n else None
+                if not n:
+                    return None
+                s, e = _scope_range(node)
+                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=str(t), start=s, end=e)
 
         # Generic fallback for other languages: conservative heuristics based on node.type names.
         # This intentionally only covers common declaration nodes to avoid false positives.
@@ -382,10 +431,16 @@ class TreeSitterChunker:
 
             if is_type:
                 n = _get_name()
-                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=t) if n else None
+                if not n:
+                    return None
+                s, e = _scope_range(node)
+                return Scope(kind=ScopeKind.TYPE, name=n, raw_type=t, start=s, end=e)
             if is_func:
                 n = _get_name()
-                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=t) if n else None
+                if not n:
+                    return None
+                s, e = _scope_range(node)
+                return Scope(kind=ScopeKind.FUNCTION, name=n, raw_type=t, start=s, end=e)
 
         return None
 
@@ -493,16 +548,27 @@ class TreeSitterChunker:
         current_scope_path: list[Scope] = []
         current_contained: list[Scope] = []
         prev_node: "Node | None" = None
+        pending_prefix_text = ""
+        pending_prefix_start: "Point | None" = None
+        pending_prefix_end: "Point | None" = None
 
         local_scope = self._scope_of_node(node, language=language, text_bytes=text_bytes, scope_stack=scope_stack)
         if local_scope is not None:
             scope_stack = [*scope_stack, local_scope]
+
+        def _scope_range_from_path(scope_path: list[Scope]) -> tuple["Point | None", "Point | None"]:
+            if not scope_path:
+                return None, None
+            last = scope_path[-1]
+            return last.start, last.end
 
         def _emit_node_as_text_chunks(
             *,
             target_node: "Node",
             boundary_prefix: list[Scope],
             contained_scopes: list[Scope],
+            prefix_text: Optional[str] = None,
+            prefix_start: "Point | None" = None,
         ) -> Generator[Chunk, None, None]:
             """
             Emit target_node.text as:
@@ -512,26 +578,42 @@ class TreeSitterChunker:
             if getattr(target_node, "text", None) is None:
                 return
             sp = target_node.start_point
-            start_pos = Point(row=sp.row + 1, column=sp.column)  # type: ignore
             node_text = target_node.text.decode()
-            if self.config.chunk_size < 0 or len(node_text) <= self.config.chunk_size:
+            full_text = (prefix_text or "") + node_text
+            if prefix_text:
+                start_pos = prefix_start or Point(row=sp.row + 1, column=sp.column)  # type: ignore
+            else:
+                start_pos = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+
+            scope_start, scope_end = _scope_range_from_path(boundary_prefix)
+
+            if self.config.chunk_size < 0 or len(full_text) <= self.config.chunk_size:
                 ep = target_node.end_point
                 yield Chunk(
-                    text=node_text,
+                    text=full_text,
                     start=start_pos,
                     end=Point(row=ep.row + 1, column=ep.column),  # type: ignore
                     scope_path=boundary_prefix,
                     contained_scopes=contained_scopes,
+                    scope_start=scope_start,
+                    scope_end=scope_end,
                 )
                 return
-            for c in self._fallback.chunk(node_text, start_pos=start_pos):
+            group_id = uuid.uuid4().hex
+            group_index = 0
+            for c in self._fallback.chunk(full_text, start_pos=start_pos):
                 yield Chunk(
                     text=c.text,
                     start=c.start,
                     end=c.end,
                     scope_path=boundary_prefix,
                     contained_scopes=contained_scopes,
+                    scope_start=scope_start,
+                    scope_end=scope_end,
+                    group_id=group_id,
+                    group_index=group_index,
                 )
+                group_index += 1
 
         def _normalize_gap_text(gap: str) -> str:
             if not self.config.trim_gap_blank_lines:
@@ -548,6 +630,51 @@ class TreeSitterChunker:
                 return "\n"
             return " "
 
+        def _is_comment_node_type(t: object) -> bool:
+            if not isinstance(t, str):
+                return False
+            tl = t.lower()
+            if "comment" in tl:
+                return True
+            return tl in {
+                "line_comment",
+                "block_comment",
+                "doc_comment",
+                "documentation_comment",
+            }
+
+        def _is_trivia_text(text: str) -> bool:
+            stripped = text.strip()
+            if not stripped:
+                return True
+            return all(ch in "{}[]();,:" for ch in stripped)
+
+        def _flush_pending_prefix_into_current() -> None:
+            nonlocal current_chunk, current_start, current_end, current_scope_path, current_contained
+            nonlocal pending_prefix_text, pending_prefix_start, pending_prefix_end
+            if not pending_prefix_text:
+                return
+            if not current_chunk:
+                full_scope_path = scope_stack.copy()
+                boundary_prefix = self._boundary_prefix(full_scope_path)
+                contained_scopes: list[Scope] = []
+                for s in self._inner_scopes_for_chunk(
+                    full_scope_path=full_scope_path, boundary_prefix=boundary_prefix
+                ):
+                    if (s.kind, s.name) not in {(x.kind, x.name) for x in contained_scopes}:
+                        contained_scopes.append(s)
+                current_chunk = pending_prefix_text
+                current_start = pending_prefix_start
+                current_end = pending_prefix_end
+                current_scope_path = boundary_prefix
+                current_contained = contained_scopes
+            else:
+                current_chunk += pending_prefix_text
+                current_end = pending_prefix_end
+            pending_prefix_text = ""
+            pending_prefix_start = None
+            pending_prefix_end = None
+
         # Leaf node: fallback to string chunking.
         if len(node.children) == 0 and getattr(node, "text", None):
             # Important: VectorCode passes node.start_point directly (potential 0/1-base mismatch).
@@ -561,12 +688,15 @@ class TreeSitterChunker:
                 if (s.kind, s.name) not in {(x.kind, x.name) for x in contained_scopes}:
                     contained_scopes.append(s)
             for c in self._fallback.chunk(node.text.decode(), start_pos=start_pos):  # type: ignore[attr-defined]
+                scope_start, scope_end = _scope_range_from_path(boundary_prefix)
                 yield Chunk(
                     text=c.text,
                     start=c.start,
                     end=c.end,
                     scope_path=boundary_prefix,
                     contained_scopes=contained_scopes,
+                    scope_start=scope_start,
+                    scope_end=scope_end,
                 )
             return
 
@@ -575,9 +705,45 @@ class TreeSitterChunker:
             child_text = child_bytes.decode()
             child_type = getattr(child, "type", None)
 
+            if self.config.mode == "function" and _is_comment_node_type(child_type):
+                gap_text = ""
+                if prev_node is not None:
+                    gap_bytes = text_bytes[prev_node.end_byte : child.start_byte]
+                    gap_text = _normalize_gap_text(gap_bytes.decode())
+                if not pending_prefix_text:
+                    sp = child.start_point
+                    pending_prefix_start = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+                    pending_prefix_text = gap_text + child_text
+                else:
+                    pending_prefix_text += gap_text + child_text
+                ep = child.end_point
+                pending_prefix_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
+                prev_node = child
+                continue
+
             child_scope = self._scope_of_node(
                 child, language=language, text_bytes=text_bytes, scope_stack=scope_stack
             )
+
+            pending_prefix_for_function: Optional[str] = None
+            pending_prefix_start_for_function: "Point | None" = None
+            if pending_prefix_text:
+                gap_text = ""
+                if prev_node is not None:
+                    gap_bytes = text_bytes[prev_node.end_byte : child.start_byte]
+                    gap_text = _normalize_gap_text(gap_bytes.decode())
+                if (
+                    child_scope is not None
+                    and child_scope.kind == ScopeKind.FUNCTION
+                    and gap_text.strip() == ""
+                ):
+                    pending_prefix_for_function = pending_prefix_text + gap_text
+                    pending_prefix_start_for_function = pending_prefix_start
+                    pending_prefix_text = ""
+                    pending_prefix_start = None
+                    pending_prefix_end = None
+                else:
+                    _flush_pending_prefix_into_current()
 
             # mode="function": if a TYPE node is small enough, emit it as ONE chunk.
             # This avoids fragmentation like:
@@ -703,6 +869,8 @@ class TreeSitterChunker:
                         target_node=child,
                         boundary_prefix=boundary_prefix,
                         contained_scopes=[],
+                        prefix_text=pending_prefix_for_function,
+                        prefix_start=pending_prefix_start_for_function,
                     )
                     prev_node = child
                     continue
@@ -799,6 +967,9 @@ class TreeSitterChunker:
 
                 yield from self._chunk_node(child, text_bytes, language=language, scope_stack=scope_stack)
                 continue
+
+            if pending_prefix_text and _is_trivia_text(pending_prefix_text):
+                _flush_pending_prefix_into_current()
             child_scope_path = scope_stack.copy()
             if child_scope is not None:
                 child_scope_path.append(child_scope)
@@ -892,6 +1063,9 @@ class TreeSitterChunker:
                 if (s.kind, s.name) not in {(x.kind, x.name) for x in current_contained}:
                     current_contained.append(s)
             prev_node = child
+
+        if pending_prefix_text:
+            _flush_pending_prefix_into_current()
 
         if current_chunk:
             assert current_start is not None
@@ -1114,45 +1288,11 @@ class TreeSitterChunker:
             end_col = len(lines[-1]) - 1 if lines else 0
             end_row = start_pos.row + (len(lines) - 1 if lines else 0)
             end_column = start_pos.column + end_col if len(lines) <= 1 else end_col
-            yield Chunk(
-                text=content,
-                start=start_pos,
-                end=Point(row=end_row, column=end_column),  # type: ignore
-                path=path,
-                sha256=sha256_value,
-                language=lang,
-                scope_path=[
-                    *(
-                        [
-                            Scope(
-                                kind=ScopeKind.FILE,
-                                name=module_value,
-                                raw_type="file",
-                                rel_path=module_relpath,
-                            )
-                        ]
-                        if module_value
-                        else []
-                    ),
-                ],
-                contained_scopes=[],
-            )
-            return
-
-        if parser is None and lang is not None and _HAS_TREESITTER:
-            try:
-                parser = get_parser(lang)  # type: ignore[arg-type]
-            except LookupError:
-                parser = None
-                lang = None
-
-        # No tree-sitter parser -> fallback to naive string chunking.
-        if parser is None:
-            for c in self._fallback.chunk(content, start_pos=start_pos):
-                yield Chunk(
-                    text=c.text,
-                    start=c.start,
-                    end=c.end,
+            yield self._attach_scope_range(
+                Chunk(
+                    text=content,
+                    start=start_pos,
+                    end=Point(row=end_row, column=end_column),  # type: ignore
                     path=path,
                     sha256=sha256_value,
                     language=lang,
@@ -1171,6 +1311,44 @@ class TreeSitterChunker:
                         ),
                     ],
                     contained_scopes=[],
+                )
+            )
+            return
+
+        if parser is None and lang is not None and _HAS_TREESITTER:
+            try:
+                parser = get_parser(lang)  # type: ignore[arg-type]
+            except LookupError:
+                parser = None
+                lang = None
+
+        # No tree-sitter parser -> fallback to naive string chunking.
+        if parser is None:
+            for c in self._fallback.chunk(content, start_pos=start_pos):
+                yield self._attach_scope_range(
+                    Chunk(
+                        text=c.text,
+                        start=c.start,
+                        end=c.end,
+                        path=path,
+                        sha256=sha256_value,
+                        language=lang,
+                        scope_path=[
+                            *(
+                                [
+                                    Scope(
+                                        kind=ScopeKind.FILE,
+                                        name=module_value,
+                                        raw_type="file",
+                                        rel_path=module_relpath,
+                                    )
+                                ]
+                                if module_value
+                                else []
+                            ),
+                        ],
+                        contained_scopes=[],
+                    )
                 )
             return
 
@@ -1253,28 +1431,30 @@ class TreeSitterChunker:
                     if _ranges_overlap(c.start, c.end, s0, s1):  # type: ignore[arg-type]
                         if (sc.kind, sc.name) not in {(x.kind, x.name) for x in contained}:
                             contained.append(sc)
-                yield Chunk(
-                    text=c.text,
-                    start=c.start,
-                    end=c.end,
-                    path=path,
-                    sha256=sha256_value,
-                    language=lang,
-                    scope_path=[
-                        *(
-                            [
-                                Scope(
-                                    kind=ScopeKind.FILE,
-                                    name=module_value,
-                                    raw_type="file",
-                                    rel_path=module_relpath,
-                                )
-                            ]
-                            if module_value
-                            else []
-                        ),
-                    ],
-                    contained_scopes=contained,
+                yield self._attach_scope_range(
+                    Chunk(
+                        text=c.text,
+                        start=c.start,
+                        end=c.end,
+                        path=path,
+                        sha256=sha256_value,
+                        language=lang,
+                        scope_path=[
+                            *(
+                                [
+                                    Scope(
+                                        kind=ScopeKind.FILE,
+                                        name=module_value,
+                                        raw_type="file",
+                                        rel_path=module_relpath,
+                                    )
+                                ]
+                                if module_value
+                                else []
+                            ),
+                        ],
+                        contained_scopes=contained,
+                    )
                 )
             return
 
@@ -1301,7 +1481,22 @@ class TreeSitterChunker:
                 rx = re.compile(pattern_str)
                 for c in chunks:
                     if rx.match(c.text) is None:
-                        yield Chunk(
+                        yield self._attach_scope_range(
+                            Chunk(
+                                text=c.text,
+                                start=c.start,
+                                end=c.end,
+                                path=path,
+                                sha256=sha256_value,
+                                language=lang,
+                                scope_path=c.scope_path,
+                                contained_scopes=c.contained_scopes,
+                            )
+                        )
+            else:
+                for c in chunks:
+                    yield self._attach_scope_range(
+                        Chunk(
                             text=c.text,
                             start=c.start,
                             end=c.end,
@@ -1311,17 +1506,6 @@ class TreeSitterChunker:
                             scope_path=c.scope_path,
                             contained_scopes=c.contained_scopes,
                         )
-            else:
-                for c in chunks:
-                    yield Chunk(
-                        text=c.text,
-                        start=c.start,
-                        end=c.end,
-                        path=path,
-                        sha256=sha256_value,
-                        language=lang,
-                        scope_path=c.scope_path,
-                        contained_scopes=c.contained_scopes,
                     )
             return
 
@@ -1344,7 +1528,22 @@ class TreeSitterChunker:
             rx = re.compile(pattern_str)
             for c in chunks:
                 if rx.match(c.text) is None:
-                    yield Chunk(
+                    yield self._attach_scope_range(
+                        Chunk(
+                            text=c.text,
+                            start=c.start,
+                            end=c.end,
+                            path=path,
+                            sha256=sha256_value,
+                            language=lang,
+                            scope_path=c.scope_path,
+                            contained_scopes=c.contained_scopes,
+                        )
+                    )
+        else:
+            for c in chunks:
+                yield self._attach_scope_range(
+                    Chunk(
                         text=c.text,
                         start=c.start,
                         end=c.end,
@@ -1354,17 +1553,6 @@ class TreeSitterChunker:
                         scope_path=c.scope_path,
                         contained_scopes=c.contained_scopes,
                     )
-        else:
-            for c in chunks:
-                yield Chunk(
-                    text=c.text,
-                    start=c.start,
-                    end=c.end,
-                    path=path,
-                    sha256=sha256_value,
-                    language=lang,
-                    scope_path=c.scope_path,
-                    contained_scopes=c.contained_scopes,
                 )
 
     def chunk(self, path: str) -> Generator[Chunk, None, None]:

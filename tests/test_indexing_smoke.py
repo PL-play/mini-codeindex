@@ -15,6 +15,8 @@ from mini_code_index.indexing import IndexConfig, index_directory, iter_candidat
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
 def _load_dotenv(path: str) -> None:
     if not os.path.isfile(path):
         return
@@ -38,6 +40,7 @@ class CaptureStore(VectorStore):
     def __init__(self) -> None:
         self.deleted_paths: list[str] = []
         self.upserts: list[dict[str, Any]] = []
+        self.saved_outputs: list[str] = []
 
     async def ping(self) -> bool:  # pragma: nocover - not used in tests
         return True
@@ -50,6 +53,49 @@ class CaptureStore(VectorStore):
 
     def get_upserts(self, path: str) -> list[dict[str, Any]]:
         return self.upserts
+
+    def dump_chunks_to_file(self, path: str) -> str:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            i = 0
+            for batch in self.upserts:
+                for doc, meta in zip(batch.get("documents", []), batch.get("metadatas", [])):
+                    f.write(f"+++++++ chunk-{i} ++++++\n")
+                    if isinstance(meta, dict):
+                        f.write(
+                            f"path={meta.get('path')} relpath={meta.get('relpath')} "
+                            f"lang={meta.get('language')} kind={meta.get('chunk_kind')}\n"
+                        )
+                        f.write(
+                            f"start={meta.get('start_line')}:{meta.get('start_col')} "
+                            f"end={meta.get('end_line')}:{meta.get('end_col')}\n"
+                        )
+                        f.write(f"scope_path={meta.get('scope_path_str')}\n")
+                        f.write(f"contained={meta.get('contained_scopes_str')}\n")
+                        f.write(f"scope_signature={meta.get('scope_signature')}\n")
+                        f.write(
+                            f"contained_scope_count={meta.get('contained_scope_count')} "
+                            f"scope_depth={meta.get('scope_depth')}\n"
+                        )
+                        f.write(f"symbol_names={meta.get('symbol_names')}\n")
+                        f.write(
+                            f"group_id={meta.get('group_id')} group_index={meta.get('group_index')}\n"
+                        )
+                        f.write(
+                            f"scope_range="
+                            f"{meta.get('scope_start_line')}:{meta.get('scope_start_col')}"
+                            f"->"
+                            f"{meta.get('scope_end_line')}:{meta.get('scope_end_col')}\n"
+                        )
+                    f.write("----- text -----\n")
+                    f.write(doc)
+                    if not doc.endswith("\n"):
+                        f.write("\n")
+                    f.write("----- /text -----\n")
+                    f.write(f"--------- chunk-{i} ---------\n\n")
+                    i += 1
+        self.saved_outputs.append(path)
+        return path
 
     async def upsert(
             self,
@@ -96,6 +142,7 @@ def test_index_directory_smoke(tmp_path) -> None:
             "**/.venv/**",
             "**/__pycache__/**",
             "**/.pytest_cache/**",
+            "**.lst"
         ],
     )
 
@@ -245,6 +292,44 @@ def test_index_directory_no_error() -> None:
         index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
     )
     print(stats)
+
+
+@pytest.mark.integration
+def test_index_directory_capture_chunks_to_file(tmp_path) -> None:
+    """Index a project and dump collected chunks into a text file."""
+    test_project_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
+    cfg = IndexConfig(
+        root_dir=str(test_project_dir),
+        dry_run=False,
+        recursive=True,
+        include_hidden=False,
+        include_globs=["**/*"],
+        exclude_globs=[
+            "**/.git/**",
+            "**/.venv/**",
+            "**/__pycache__/**",
+            "**/.pytest_cache/**",
+            "**.class",
+            "**.lst"
+        ],
+    )
+    chunk_cfg = ChunkConfig(
+        chunk_size=1200,
+        overlap_ratio=0.1,
+        encoding="utf8",
+        mode="function",
+    )
+    store = CaptureStore()
+    embedder = DummyEmbedder()
+
+    stats = asyncio.run(
+        index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    )
+    print(stats)
+
+    output_path = os.path.join("./", "captured_chunks.txt")
+    store.dump_chunks_to_file(output_path)
+    print(f"wrote chunks to: {output_path}")
 
 
 @pytest.mark.integration

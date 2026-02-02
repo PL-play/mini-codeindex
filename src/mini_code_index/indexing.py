@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, List, Optional, Sequence
 
-from .chunking import Chunk, Config as ChunkConfig, TreeSitterChunker, format_scope
+from .chunking import Chunk, Config as ChunkConfig, TreeSitterChunker, format_scope, ScopeKind
 from .db import VectorStore
 from .embedding import Embedder
 from .logging_utils import setup_logging
@@ -278,6 +278,18 @@ def _build_chunk_metadata(
     if chunk.end is not None:
         meta["end_line"] = int(getattr(chunk.end, "row", 0))
         meta["end_col"] = int(getattr(chunk.end, "column", 0))
+    scope_start = getattr(chunk, "scope_start", None)
+    scope_end = getattr(chunk, "scope_end", None)
+    if scope_start is not None:
+        meta["scope_start_line"] = int(getattr(scope_start, "row", 0))
+        meta["scope_start_col"] = int(getattr(scope_start, "column", 0))
+    if scope_end is not None:
+        meta["scope_end_line"] = int(getattr(scope_end, "row", 0))
+        meta["scope_end_col"] = int(getattr(scope_end, "column", 0))
+    if getattr(chunk, "group_id", None) is not None:
+        meta["group_id"] = chunk.group_id
+    if getattr(chunk, "group_index", None) is not None:
+        meta["group_index"] = int(chunk.group_index)
     if chunk.language is not None:
         meta["language"] = chunk.language
     return meta
@@ -345,6 +357,51 @@ def _prepare_chunks_for_file_sync(
     for c in chunks:
         c.path = file_path
         c.sha256 = file_sha256
+
+    if chunk_cfg.mode in {"type", "function"}:
+        def _scope_group_key(c: Chunk) -> Optional[tuple]:
+            if not c.scope_path:
+                return None
+            last = c.scope_path[-1]
+            if getattr(last, "kind", None) not in {ScopeKind.TYPE, ScopeKind.FUNCTION}:
+                return None
+            start = getattr(last, "start", None)
+            end = getattr(last, "end", None)
+            return (
+                getattr(last.kind, "value", str(last.kind)),
+                getattr(last, "name", None),
+                getattr(last, "raw_type", None),
+                getattr(start, "row", None),
+                getattr(start, "column", None),
+                getattr(end, "row", None),
+                getattr(end, "column", None),
+            )
+
+        groups: dict[tuple, list[Chunk]] = {}
+        for c in chunks:
+            key = _scope_group_key(c)
+            if key is None:
+                continue
+            groups.setdefault(key, []).append(c)
+
+        for key, items in groups.items():
+            if len(items) <= 1:
+                continue
+            if all(getattr(c, "group_id", None) is not None for c in items):
+                continue
+            group_id = uuid.uuid4().hex
+            items_sorted = sorted(
+                items,
+                key=lambda c: (
+                    getattr(c.start, "row", 0) if c.start else 0,
+                    getattr(c.start, "column", 0) if c.start else 0,
+                ),
+            )
+            for idx, c in enumerate(items_sorted):
+                if getattr(c, "group_id", None) is None:
+                    c.group_id = group_id
+                if getattr(c, "group_index", None) is None:
+                    c.group_index = idx
 
     return _expand_chunks(chunks=chunks, file_path=file_path, rel_path=rel_path)
 
