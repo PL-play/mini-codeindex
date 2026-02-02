@@ -292,6 +292,8 @@ def _build_chunk_metadata(
         meta["group_index"] = int(chunk.group_index)
     if chunk.language is not None:
         meta["language"] = chunk.language
+    if getattr(chunk, "mode", None) is not None:
+        meta["mode"] = chunk.mode
     return meta
 
 

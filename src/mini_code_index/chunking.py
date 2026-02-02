@@ -98,6 +98,7 @@ class Chunk:
     path: Optional[str] = None
     sha256: Optional[str] = None
     language: Optional[str] = None
+    mode: Optional[str] = None
     # When a chunk represents (part of) a scoped declaration (function/type),
     # record the original scope node positions.
     scope_start: "Point | None" = None
@@ -175,6 +176,8 @@ class Config:
     chunk_filters: dict[str, list[str]] = None  # language -> patterns, "*" for default
     filetype_map: dict[str, list[str]] = None  # language -> [regex over extension]
     trim_gap_blank_lines: bool = True
+    force_merge_trivia: bool = True
+    force_merge_comments: bool = True
     # Chunking strategy:
     # - "file": pure text chunking at file level (still annotates contained_scopes)
     # - "type": type container as primary unit
@@ -229,6 +232,7 @@ class StringChunker:
                     row=data.count("\n") + start_pos.row,
                     column=len(data.split("\n")[-1]) - 1,
                 ),
+                mode=self.config.mode,
             )
             return
 
@@ -273,6 +277,7 @@ class StringChunker:
                 text=chunk_text,
                 start=Point(row=chunk_start_row, column=chunk_start_column),  # type: ignore
                 end=Point(row=chunk_end_row, column=chunk_end_column),  # type: ignore
+                mode=self.config.mode,
             )
 
             if i + self.config.chunk_size >= len(data):
@@ -323,7 +328,32 @@ class TreeSitterChunker:
         with open(path, encoding=encoding) as f:
             return f.read()
 
+    @staticmethod
+    def _is_trivia_text(text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return True
+        return all(ch in "{}[]();,:" for ch in stripped)
+
+    @staticmethod
+    def _is_comment_text(text: str) -> bool:
+        lines = text.splitlines()
+        if not lines:
+            return False
+        tokens = ("//", "/*", "*", "#", "--", "///", "/**")
+        has_non_empty = False
+        for ln in lines:
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            has_non_empty = True
+            if not stripped.startswith(tokens):
+                return False
+        return has_non_empty
+
     def _attach_scope_range(self, chunk: Chunk) -> Chunk:
+        if chunk.mode is None:
+            chunk.mode = self.config.mode
         if (chunk.scope_start is None or chunk.scope_end is None) and chunk.scope_path:
             last = chunk.scope_path[-1]
             if chunk.scope_start is None:
@@ -331,6 +361,126 @@ class TreeSitterChunker:
             if chunk.scope_end is None:
                 chunk.scope_end = last.end
         return chunk
+
+    def _merge_comment_chunks(self, chunks: Generator[Chunk, None, None]) -> Generator[Chunk, None, None]:
+        if not self.config.force_merge_comments:
+            yield from chunks
+            return
+
+        def _trim_for_append(text: str) -> str:
+            return text.lstrip()
+
+        def _trim_for_prepend(text: str) -> str:
+            return text.rstrip()
+
+        prev: Chunk | None = None
+        pending: Chunk | None = None
+
+        for c in chunks:
+            if self._is_comment_text(c.text):
+                if prev is not None and prev.scope_path == c.scope_path:
+                    append_text = _trim_for_append(c.text)
+                    if append_text:
+                        prev.text += append_text
+                        prev.end = c.end
+                    continue
+                if pending is None:
+                    pending = c
+                    continue
+
+            if pending is not None:
+                if pending.scope_path == c.scope_path:
+                    prepend_text = _trim_for_prepend(pending.text)
+                    if prepend_text:
+                        c.text = prepend_text + c.text
+                        c.start = pending.start
+                    pending = None
+                else:
+                    if prev is not None:
+                        yield prev
+                    yield pending
+                    prev = None
+                    pending = None
+
+            if prev is not None:
+                yield prev
+            prev = c
+
+        if pending is not None:
+            if prev is not None and prev.scope_path == pending.scope_path:
+                append_text = _trim_for_append(pending.text)
+                if append_text:
+                    prev.text += append_text
+                    prev.end = pending.end
+            else:
+                if prev is not None:
+                    yield prev
+                yield pending
+                prev = None
+            pending = None
+
+        if prev is not None:
+            yield prev
+
+    def _merge_trivia_chunks(self, chunks: Generator[Chunk, None, None]) -> Generator[Chunk, None, None]:
+        if not self.config.force_merge_trivia:
+            yield from chunks
+            return
+
+        def _trim_for_append(text: str) -> str:
+            return text.lstrip()
+
+        def _trim_for_prepend(text: str) -> str:
+            return text.rstrip()
+
+        prev: Chunk | None = None
+        pending: Chunk | None = None
+
+        for c in chunks:
+            if self._is_trivia_text(c.text):
+                if prev is not None and prev.scope_path == c.scope_path:
+                    append_text = _trim_for_append(c.text)
+                    if append_text:
+                        prev.text += append_text
+                        prev.end = c.end
+                    continue
+                if pending is None:
+                    pending = c
+                    continue
+
+            if pending is not None:
+                if pending.scope_path == c.scope_path:
+                    prepend_text = _trim_for_prepend(pending.text)
+                    if prepend_text:
+                        c.text = prepend_text + c.text
+                        c.start = pending.start
+                    pending = None
+                else:
+                    if prev is not None:
+                        yield prev
+                    yield pending
+                    prev = None
+                    pending = None
+
+            if prev is not None:
+                yield prev
+            prev = c
+
+        if pending is not None:
+            if prev is not None and prev.scope_path == pending.scope_path:
+                append_text = _trim_for_append(pending.text)
+                if append_text:
+                    prev.text += append_text
+                    prev.end = pending.end
+            else:
+                if prev is not None:
+                    yield prev
+                yield pending
+                prev = None
+            pending = None
+
+        if prev is not None:
+            yield prev
 
     def _scope_of_node(
         self,
@@ -643,12 +793,6 @@ class TreeSitterChunker:
                 "documentation_comment",
             }
 
-        def _is_trivia_text(text: str) -> bool:
-            stripped = text.strip()
-            if not stripped:
-                return True
-            return all(ch in "{}[]();,:" for ch in stripped)
-
         def _flush_pending_prefix_into_current() -> None:
             nonlocal current_chunk, current_start, current_end, current_scope_path, current_contained
             nonlocal pending_prefix_text, pending_prefix_start, pending_prefix_end
@@ -705,25 +849,71 @@ class TreeSitterChunker:
             child_text = child_bytes.decode()
             child_type = getattr(child, "type", None)
 
+            child_scope = self._scope_of_node(
+                child, language=language, text_bytes=text_bytes, scope_stack=scope_stack
+            )
+
             if self.config.mode == "function" and _is_comment_node_type(child_type):
                 gap_text = ""
                 if prev_node is not None:
                     gap_bytes = text_bytes[prev_node.end_byte : child.start_byte]
                     gap_text = _normalize_gap_text(gap_bytes.decode())
-                if not pending_prefix_text:
-                    sp = child.start_point
-                    pending_prefix_start = Point(row=sp.row + 1, column=sp.column)  # type: ignore
-                    pending_prefix_text = gap_text + child_text
+                can_append = (
+                    current_chunk
+                    and (
+                        self.config.force_merge_comments
+                        or self.config.chunk_size < 0
+                        or len(current_chunk) + len(gap_text) + len(child_text) <= self.config.chunk_size
+                    )
+                )
+                if can_append:
+                    current_chunk += gap_text + child_text
+                    ep = child.end_point
+                    current_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
                 else:
-                    pending_prefix_text += gap_text + child_text
-                ep = child.end_point
-                pending_prefix_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
+                    if not pending_prefix_text:
+                        sp = child.start_point
+                        pending_prefix_start = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+                        pending_prefix_text = gap_text + child_text
+                    else:
+                        pending_prefix_text += gap_text + child_text
+                    ep = child.end_point
+                    pending_prefix_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
                 prev_node = child
                 continue
 
-            child_scope = self._scope_of_node(
-                child, language=language, text_bytes=text_bytes, scope_stack=scope_stack
-            )
+            if (
+                self.config.mode in {"function", "type"}
+                and child_scope is None
+                and self._is_trivia_text(child_text)
+            ):
+                gap_text = ""
+                if prev_node is not None:
+                    gap_bytes = text_bytes[prev_node.end_byte : child.start_byte]
+                    gap_text = _normalize_gap_text(gap_bytes.decode())
+                can_append = (
+                    current_chunk
+                    and (
+                        self.config.force_merge_trivia
+                        or self.config.chunk_size < 0
+                        or len(current_chunk) + len(gap_text) + len(child_text) <= self.config.chunk_size
+                    )
+                )
+                if can_append:
+                    current_chunk += gap_text + child_text
+                    ep = child.end_point
+                    current_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
+                else:
+                    if not pending_prefix_text:
+                        sp = child.start_point
+                        pending_prefix_start = Point(row=sp.row + 1, column=sp.column)  # type: ignore
+                        pending_prefix_text = gap_text + child_text
+                    else:
+                        pending_prefix_text += gap_text + child_text
+                    ep = child.end_point
+                    pending_prefix_end = Point(row=ep.row + 1, column=ep.column)  # type: ignore
+                prev_node = child
+                continue
 
             pending_prefix_for_function: Optional[str] = None
             pending_prefix_start_for_function: "Point | None" = None
@@ -1479,7 +1669,7 @@ class TreeSitterChunker:
             )
             if pattern_str:
                 rx = re.compile(pattern_str)
-                for c in chunks:
+                for c in self._merge_trivia_chunks(self._merge_comment_chunks(chunks)):
                     if rx.match(c.text) is None:
                         yield self._attach_scope_range(
                             Chunk(
@@ -1494,7 +1684,7 @@ class TreeSitterChunker:
                             )
                         )
             else:
-                for c in chunks:
+                for c in self._merge_trivia_chunks(self._merge_comment_chunks(chunks)):
                     yield self._attach_scope_range(
                         Chunk(
                             text=c.text,
@@ -1526,7 +1716,7 @@ class TreeSitterChunker:
 
         if pattern_str:
             rx = re.compile(pattern_str)
-            for c in chunks:
+            for c in self._merge_trivia_chunks(self._merge_comment_chunks(chunks)):
                 if rx.match(c.text) is None:
                     yield self._attach_scope_range(
                         Chunk(
@@ -1541,7 +1731,7 @@ class TreeSitterChunker:
                         )
                     )
         else:
-            for c in chunks:
+            for c in self._merge_trivia_chunks(self._merge_comment_chunks(chunks)):
                 yield self._attach_scope_range(
                     Chunk(
                         text=c.text,

@@ -64,7 +64,8 @@ class CaptureStore(VectorStore):
                     if isinstance(meta, dict):
                         f.write(
                             f"path={meta.get('path')} relpath={meta.get('relpath')} "
-                            f"lang={meta.get('language')} kind={meta.get('chunk_kind')}\n"
+                            f"lang={meta.get('language')} kind={meta.get('chunk_kind')} "
+                            f"mode={meta.get('mode')}\n"
                         )
                         f.write(
                             f"start={meta.get('start_line')}:{meta.get('start_col')} "
@@ -73,6 +74,7 @@ class CaptureStore(VectorStore):
                         f.write(f"scope_path={meta.get('scope_path_str')}\n")
                         f.write(f"contained={meta.get('contained_scopes_str')}\n")
                         f.write(f"scope_signature={meta.get('scope_signature')}\n")
+                        f.write(f"language={meta.get('language')} mode={meta.get('mode')}\n")
                         f.write(
                             f"contained_scope_count={meta.get('contained_scope_count')} "
                             f"scope_depth={meta.get('scope_depth')}\n"
