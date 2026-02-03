@@ -248,14 +248,26 @@ def _build_chunk_metadata(
             "rel_path": getattr(scope, "rel_path", None),
         }
 
+    def scope_to_compact(scope: Any) -> str:
+        kind = getattr(scope.kind, "value", str(scope.kind))
+        name = scope.name
+        raw_type = getattr(scope, "raw_type", None)
+        rel_path = getattr(scope, "rel_path", None)
+        extras: list[str] = []
+        if raw_type:
+            extras.append(f"raw={raw_type}")
+        if rel_path:
+            extras.append(f"path={rel_path}")
+        suffix = f"{{{','.join(extras)}}}" if extras else ""
+        return f"{kind}@{name}{suffix}"
+
     scope_path_list = [scope_to_dict(s) for s in chunk.scope_path]
     contained_scopes_list = [scope_to_dict(s) for s in chunk.contained_scopes]
-    scope_path_str = " -> ".join(format_scope(s) for s in chunk.scope_path)
-    contained_scopes_str = ", ".join(format_scope(s) for s in chunk.contained_scopes)
-    symbol_names = [s.name for s in chunk.scope_path if getattr(s, "name", None)]
-    scope_signature = " -> ".join(
-        f"{getattr(s.kind, 'value', s.kind)} {s.name}" for s in chunk.scope_path
-    )
+    scope_path_str = "::".join(scope_to_compact(s) for s in chunk.scope_path)
+    contained_scopes_str = json.dumps(contained_scopes_list, ensure_ascii=False)
+    symbol_names = ""
+    if chunk.scope_path:
+        symbol_names = scope_to_compact(chunk.scope_path[-1])
 
     meta: dict[str, Any] = {
         "path": file_path,
@@ -268,10 +280,19 @@ def _build_chunk_metadata(
         "scope_path_str": scope_path_str,
         "contained_scopes_str": contained_scopes_str,
         "scope_depth": len(chunk.scope_path),
-        "symbol_names": json.dumps(symbol_names, ensure_ascii=False),
-        "scope_signature": scope_signature,
+        "symbol_names": symbol_names,
         "contained_scope_count": len(chunk.contained_scopes),
     }
+    trimmed_text = (chunk.text or "").strip()
+    is_trivia = bool(trimmed_text == "" or all(ch in "{}[]();,:" for ch in trimmed_text))
+    is_comment = False
+    if trimmed_text:
+        tokens = ("//", "/*", "*", "#", "--", "///", "/**")
+        lines = trimmed_text.splitlines()
+        if lines and all((not ln.strip()) or ln.strip().startswith(tokens) for ln in lines):
+            is_comment = True
+    meta["is_trivia"] = is_trivia
+    meta["is_comment"] = is_comment
     if chunk.start is not None:
         meta["start_line"] = int(getattr(chunk.start, "row", 0))
         meta["start_col"] = int(getattr(chunk.start, "column", 0))
@@ -311,19 +332,36 @@ def _expand_chunks(*, chunks: list[Chunk], file_path: str, rel_path: str) -> lis
             meta_chunk.end = source.end
         return meta_chunk
 
+    def _scope_to_compact(scope: Any) -> str:
+        kind = getattr(scope.kind, "value", str(scope.kind))
+        name = scope.name
+        raw_type = getattr(scope, "raw_type", None)
+        rel_path = getattr(scope, "rel_path", None)
+        extras: list[str] = []
+        if raw_type:
+            extras.append(f"raw={raw_type}")
+        if rel_path:
+            extras.append(f"path={rel_path}")
+        suffix = f"{{{','.join(extras)}}}" if extras else ""
+        return f"{kind}@{name}{suffix}"
+
     rel_chunk = _attach_source(Chunk(text=f"relpath: {rel_path}"), source=chunks[0] if chunks else None)
     expanded.append((rel_chunk, "relpath"))
 
+    seen_scope_paths: set[str] = set()
     for source in chunks:
         if len(source.scope_path) <= 1:
             continue
-        scope_path_str = " -> ".join(format_scope(s) for s in source.scope_path)
+        scope_path_str = "::".join(_scope_to_compact(s) for s in source.scope_path)
         if not scope_path_str:
             continue
-        containers_str = ", ".join(format_scope(s) for s in source.contained_scopes)
-        suffix = f" | containers: {containers_str}" if containers_str else ""
+        if scope_path_str in seen_scope_paths:
+            continue
+        seen_scope_paths.add(scope_path_str)
+        containers_str = "::".join(_scope_to_compact(s) for s in source.contained_scopes)
+        suffix = f"|containers: {containers_str}" if containers_str else ""
         scope_chunk = _attach_source(
-            Chunk(text=f"scope_path: {scope_path_str}{suffix}"),
+            Chunk(text=f"{scope_path_str}{suffix}"),
             source=source,
         )
         expanded.append((scope_chunk, "scope_path"))

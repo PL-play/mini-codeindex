@@ -73,7 +73,6 @@ class CaptureStore(VectorStore):
                         )
                         f.write(f"scope_path={meta.get('scope_path_str')}\n")
                         f.write(f"contained={meta.get('contained_scopes_str')}\n")
-                        f.write(f"scope_signature={meta.get('scope_signature')}\n")
                         f.write(f"language={meta.get('language')} mode={meta.get('mode')}\n")
                         f.write(
                             f"contained_scope_count={meta.get('contained_scope_count')} "
@@ -88,6 +87,10 @@ class CaptureStore(VectorStore):
                             f"{meta.get('scope_start_line')}:{meta.get('scope_start_col')}"
                             f"->"
                             f"{meta.get('scope_end_line')}:{meta.get('scope_end_col')}\n"
+                        )
+                        f.write(
+                            f"is_trivia={meta.get('is_trivia')} "
+                            f"is_comment={meta.get('is_comment')}\n"
                         )
                     f.write("----- text -----\n")
                     f.write(doc)
@@ -413,12 +416,14 @@ def test_chromadb_query_smoke() -> None:
         pytest.skip(f"Collection not found: {e}")
 
     async def _run_query() -> Any:
-        query = "加密"
+        query = "decorate"
         async with embedder:
             embedding = (await embedder.embed([query]))[0]
             results = collection.query(
                 query_embeddings=[embedding],
-                n_results=5,
+                n_results=25,
+                # where={"$and": [{"chunk_kind": "code"}, {"is_trivia": False}]},
+                where={"$and": [{"is_comment": False}, {"is_trivia": False}]},
             )
             return results
 
