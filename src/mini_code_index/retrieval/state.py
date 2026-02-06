@@ -6,7 +6,7 @@ import operator
 from typing import Annotated, List, Optional, Dict, Any
 
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices
 from typing_extensions import Required, TypedDict
 
 class RetrievalAgentState(TypedDict, total=False):
@@ -38,8 +38,16 @@ class RetrievalPlan(BaseModel):
 class SubTask(BaseModel):
     """Single retrieval subtask descriptor."""
 
-    title: str = Field(description="Short title for the subtask")
-    query: str = Field(description="Focused query for this subtask")
+    # Keep this model name for now, but make fields more general.
+    # Backward-compatible: accept old keys (title/query) as input.
+    name: str = Field(
+        validation_alias=AliasChoices("name", "title"),
+        description="Short name for the work item",
+    )
+    instruction: str = Field(
+        validation_alias=AliasChoices("instruction", "query"),
+        description="Standalone instruction/question for this work item",
+    )
 
 
 class EvidenceItem(BaseModel):
@@ -108,13 +116,28 @@ class PlannerState(TypedDict):
 class SubtaskState(TypedDict):
     """Subtask graph state for retrieval/synthesis/verification."""
 
+    # Context
+    root_dir: str
     messages: Annotated[list[BaseMessage], operator.add]
+
+    # The current subtask the subgraph is working on.
+    # verify may refine this (e.g., narrower query) for the next retrieval round.
     sub_task: SubTask
-    evidence: Annotated[list[EvidenceItem], operator.add]
-    result: Optional[SubtaskResult]
-    needs_more: bool
+    next_sub_task: Optional[SubTask]
+
+    # Tool-calling loop control (inside retrieval phase)
+    tool_call_iterations: int
+    max_tool_call_iterations: int
+    last_step_had_tool_calls: bool
+
+    # Retrieval rounds control (across verify -> possible next retrieval round)
     iteration: int
     max_iterations: int
+    needs_more: bool
+
+    # Outputs
+    evidence: Annotated[list[EvidenceItem], operator.add]
+    result: Optional[SubtaskResult]
     notes: Annotated[list[str], operator.add]
 
 
