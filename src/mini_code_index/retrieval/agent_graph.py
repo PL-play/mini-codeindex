@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import sys
+import os
+
+from .util.interface import OpenAICompatibleChatConfig, LLMRequest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
+
+
 """LangGraph-based retrieval agent workflow (skeleton).
 
 This module defines the overall graph structure, roles, and state
@@ -7,6 +15,7 @@ for the retrieval agent. Node implementations are intentionally
 left as placeholders (docstrings only) per requirement.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional, TypedDict
@@ -15,11 +24,9 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
 from mini_code_index.retrieval.prompts import planner_system_prompt
-from mini_code_index.retrieval.state import RetrievalPlan
-from utils.interface import LLMRequest, OpenAICompatibleChatConfig
-from utils.llm_factory import OpenAICompatibleChatLLMService
-from utils.llm_utils import log_llm_json_result
-
+from mini_code_index.retrieval.state import RetrievalPlan, RetrievalAgentState, SubtaskState
+from .util.llm_factory import OpenAICompatibleChatLLMService
+from .util.llm_utils import log_llm_json_result
 
 logger = logging.getLogger(__name__)
 
@@ -39,35 +46,6 @@ def _load_planner_config() -> OpenAICompatibleChatConfig:
     )
 
 
-class RetrievalAgentState(TypedDict, total=False):
-    """State for the retrieval agent workflow.
-
-    Fields are intentionally broad to support different query types.
-    """
-
-    query: str
-    plan: Dict[str, Any]
-    sub_tasks: List[Dict[str, Any]]
-    sub_results: List[Dict[str, Any]]
-    answer: str
-    needs_more: bool
-    iteration: int
-    max_iterations: int
-    notes: str
-
-
-class SubtaskState(TypedDict, total=False):
-    """State for each subtask sub-graph."""
-
-    sub_task: Dict[str, Any]
-    evidence: List[Dict[str, Any]]
-    result: Dict[str, Any]
-    needs_more: bool
-    iteration: int
-    max_iterations: int
-    notes: str
-
-
 async def planner_node(state: RetrievalAgentState) -> Command:
     """Planner/Supervisor node.
 
@@ -75,6 +53,10 @@ async def planner_node(state: RetrievalAgentState) -> Command:
     - Analyze the user query.
     - Produce a high-level plan and sub-task list.
     """
+    root_dir = str(state.get("root_dir", "") or "").strip()
+    if not root_dir:
+        raise ValueError("Missing required field: root_dir")
+
     query = str(state.get("query", "") or "").strip()
     if not query:
         return Command(update={"plan": None, "sub_tasks": [], "notes": "empty_query"})
@@ -101,7 +83,7 @@ async def planner_node(state: RetrievalAgentState) -> Command:
 
     logger.info(f"[planner] plan={plan_dict}")
 
-    return Command(update={"plan": plan_dict, "sub_tasks": sub_tasks, "notes": "planner_ok"})
+    return Command(goto="run_subtasks",update={"plan": plan_dict, "sub_tasks": sub_tasks, "notes": "planner_ok"})
 
 
 async def retrieval_node(state: SubtaskState) -> Command:
@@ -134,21 +116,6 @@ async def verify_node(state: SubtaskState) -> Command:
     - Set needs_more flag.
     """
     raise NotImplementedError
-
-
-async def run_subtasks_node(state: RetrievalAgentState) -> Command:
-    """Execute subtask sub-graphs in parallel.
-
-    Responsibilities (to be implemented):
-    - Fan out sub_tasks to the subtask graph (parallel execution).
-    - Collect sub_results.
-
-    Note:
-        This node is reserved for a future implementation. In the current
-        graph skeleton, the subtask graph is used directly as a node.
-    """
-    raise NotImplementedError
-
 
 async def summarize_node(state: RetrievalAgentState) -> Command:
     """Summarize all subtask results.
@@ -194,24 +161,57 @@ def build_subtask_graph() -> Any:
     )
     return graph.compile()
 
+subtask_graph = build_subtask_graph()
+
+async def run_subtasks_node(state: RetrievalAgentState) -> Command:
+    """Execute subtask sub-graphs in parallel.
+
+    Responsibilities (to be implemented):
+    - Fan out sub_tasks to the subtask graph (parallel execution).
+    - Collect sub_results.
+
+    Note:
+        This node is reserved for a future implementation. In the current
+        graph skeleton, the subtask graph is used directly as a node.
+    """
+    root_dir = str(state.get("root_dir", "") or "").strip()
+    if not root_dir:
+        raise ValueError("Missing required field: root_dir")
+
+    sub_tasks = list(state.get("sub_tasks") or [])
+    if not sub_tasks:
+        return Command(update={"sub_results": [], "notes": "no_subtasks"})
+
+    max_iterations = int(state.get("max_iterations", 2))
+
+    async def _run_one(task: Dict[str, Any]) -> Dict[str, Any]:
+        return await subtask_graph.ainvoke(
+            {
+                "sub_task": task,
+                "iteration": 0,
+                "max_iterations": max_iterations,
+                "root_dir": root_dir,
+            }
+        )
+
+    results = await asyncio.gather(*[_run_one(task) for task in sub_tasks])
+    return Command(update={"sub_results": results, "notes": "subtasks_done"})
 
 def build_retrieval_agent_graph() -> Any:
     """Build a complete retrieval agent graph (skeleton).
 
-    Main flow:
-            planner -> subtask_graph(parallel) -> summarize -> END
+        Main flow:
+            planner -> run_subtasks(parallel) -> summarize -> END
     """
     graph = StateGraph(RetrievalAgentState)
 
-    subgraph = build_subtask_graph()
-
     graph.add_node("planner", planner_node)
+    graph.add_node("run_subtasks", run_subtasks_node)
     graph.add_node("summarize", summarize_node)
-    graph.add_node("subtask_graph", subgraph)
 
     graph.set_entry_point("planner")
-    graph.add_edge("planner", "subtask_graph")
-    graph.add_edge("subtask_graph", "summarize")
+    graph.add_edge("planner", "run_subtasks")
+    graph.add_edge("run_subtasks", "summarize")
     graph.add_edge("summarize", END)
 
     return graph.compile()
@@ -242,7 +242,7 @@ def main() -> None:
     except Exception:
         mermaid = (
             "graph LR\n"
-            "  planner --> subtask_graph --> summarize --> END\n"
+            "  planner --> run_subtasks --> summarize --> END\n"
             "  subgraph subtask_graph\n"
             "    retrieval --> synthesize --> verify\n"
             "    verify --> retrieval\n"

@@ -14,7 +14,7 @@ import logging
 import re
 from typing import Any, Dict, Optional, Tuple
 
-from utils.interface import LLMResponse
+from .interface import LLMResponse
 
 
 def log_llm_json_result(

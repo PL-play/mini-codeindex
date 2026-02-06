@@ -20,8 +20,11 @@ class TestRetrievalAgentGraph(unittest.TestCase):
         except Exception as exc:
             print("graph visualization info unavailable:", exc)
         query = "这个项目是做什么的？"
+        root_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
         try:
-            result = asyncio.run(graph.ainvoke({"query": query, "max_iterations": 2}))
+            result = asyncio.run(
+                graph.ainvoke({"query": query, "root_dir": root_dir, "max_iterations": 2})
+            )
             print("graph run result:", result)
         except Exception as exc:
             print("graph run failed (expected if subgraph nodes not implemented):", exc)

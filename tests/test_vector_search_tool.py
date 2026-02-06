@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import unittest
 
-from mini_code_index.retrieval.utils import code_vector_search_tool
+from mini_code_index.retrieval.util import code_vector_search_tool
 
 
 def _pretty_json(raw_json: str) -> str:

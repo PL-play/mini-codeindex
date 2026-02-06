@@ -17,9 +17,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 from openai import AsyncOpenAI, AsyncStream
 
-from utils.interface import LLMService, OpenAICompatibleChatConfig, LLMTokenUsage, LLMRequest, LLMResponse, \
+from .interface import LLMService, OpenAICompatibleChatConfig, LLMTokenUsage, LLMRequest, LLMResponse, \
     LLMStreamChunk
-from utils.llm_utils import parse_json_from_model_output_detailed
+from .llm_utils import parse_json_from_model_output_detailed
 
 try:
     from openai.types.chat import ChatCompletion, ChatCompletionMessage, \

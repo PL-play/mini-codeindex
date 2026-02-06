@@ -3,12 +3,28 @@
 from __future__ import annotations
 
 import operator
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Dict, Any
 
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field
-from typing_extensions import TypedDict
+from typing_extensions import Required, TypedDict
 
+class RetrievalAgentState(TypedDict, total=False):
+    """State for the retrieval agent workflow.
+
+    Fields are intentionally broad to support different query types.
+    """
+
+    root_dir: Required[str]
+    query: Required[str]
+    plan: Dict[str, Any]
+    sub_tasks: List[Dict[str, Any]]
+    sub_results: List[Dict[str, Any]]
+    answer: str
+    needs_more: bool
+    iteration: int
+    max_iterations: int
+    notes: str
 
 class RetrievalPlan(BaseModel):
     """High-level plan guiding the overall retrieval workflow."""
@@ -69,6 +85,7 @@ class AgentState(TypedDict):
     """Main agent state across the retrieval workflow."""
 
     messages: Annotated[list[BaseMessage], operator.add]
+    root_dir: str
     query: str
     plan: Optional[RetrievalPlan]
     sub_tasks: List[SubTask]

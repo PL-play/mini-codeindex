@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import unittest
 
-from mini_code_index.retrieval.utils import (
+from mini_code_index.retrieval.util import (
     file_metadata_tool,
     find_references_tool,
     language_stats_tool,

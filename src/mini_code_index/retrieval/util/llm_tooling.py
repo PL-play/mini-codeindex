@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Type, Union, get_args, get_origin
 
-from utils.interface import LLMService, LLMRequest, LLMResponse, LLMMessage, LLMTool
+from .interface import LLMService, LLMRequest, LLMResponse, LLMMessage, LLMTool
 
 try:
     # Optional dependency (already used in other parts of this mono-repo).
