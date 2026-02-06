@@ -18,6 +18,7 @@ from .local_search import (
     tree_summary,
     tree_summary_tool,
 )
+from .vector_search import code_vector_search_tool
 
 __all__ = [
     "text_search",
@@ -36,4 +37,5 @@ __all__ = [
     "file_metadata_tool",
     "language_stats",
     "language_stats_tool",
+    "code_vector_search_tool",
 ]

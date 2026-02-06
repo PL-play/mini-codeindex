@@ -368,7 +368,7 @@ def test_full_pipeline_with_real_services() -> None:
         ],
     )
     chunk_cfg = ChunkConfig(
-        chunk_size=1200,
+        chunk_size=500,
         overlap_ratio=0.1,
         encoding="utf8",
         mode="function",
@@ -416,14 +416,14 @@ def test_chromadb_query_smoke() -> None:
         pytest.skip(f"Collection not found: {e}")
 
     async def _run_query() -> Any:
-        query = "decorate"
+        query = "加密"
         async with embedder:
             embedding = (await embedder.embed([query]))[0]
             results = collection.query(
                 query_embeddings=[embedding],
-                n_results=25,
+                n_results=1,
                 # where={"$and": [{"chunk_kind": "code"}, {"is_trivia": False}]},
-                where={"$and": [{"is_comment": False}, {"is_trivia": False}]},
+                where={"$and": [{"chunk_kind": "code"}, {"is_comment": False}, {"is_trivia": False}]},
             )
             return results
 
