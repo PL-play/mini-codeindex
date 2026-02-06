@@ -404,7 +404,7 @@ class OpenAICompatibleChatConfig:
     timeout_s: float = 180.0
     max_tokens: int = 4096
     temperature: float = 0.0
-    max_retries: int = 1
+    max_retries: int = 3
     retry_base_delay_s: float = 0.5
 
     @property
