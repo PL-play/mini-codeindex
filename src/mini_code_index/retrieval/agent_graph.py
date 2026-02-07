@@ -73,7 +73,7 @@ async def planner_node(state: RetrievalAgentState) -> Command:
         system_prompt=planner_system_prompt,
         parse_json=True,
         temperature=0.0,
-        max_tokens=2000,
+        max_tokens=4000,
     )
     resp = await client.complete(req)
     # log_llm_json_result(logger, resp, prefix="[planner]")

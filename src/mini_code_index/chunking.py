@@ -1456,7 +1456,7 @@ class TreeSitterChunker:
         module_relpath: Optional[str] = None
         if path is not None:
             base = os.path.basename(path)
-            module_value = base
+            module_value = os.path.splitext(base)[0]
             module_relpath = os.path.relpath(path).replace(os.sep, "/")
             while module_relpath.startswith("../"):
                 module_relpath = module_relpath[3:]

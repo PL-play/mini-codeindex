@@ -8,6 +8,9 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
+from mini_code_index.retrieval.util.interface import OpenAICompatibleChatConfig, LLMRequest
+from mini_code_index.retrieval.util.llm_factory import OpenAICompatibleChatLLMService
+from mini_code_index.retrieval.util.llm_utils import log_llm_json_result
 from mini_code_index.retrieval_defs import (
     ENV_REWRITE_API_KEY,
     ENV_REWRITE_BASE_URL,
@@ -15,9 +18,6 @@ from mini_code_index.retrieval_defs import (
     GraphState,
     REWRITE_SYSTEM_PROMPT,
 )
-from utils.interface import LLMRequest, OpenAICompatibleChatConfig
-from utils.llm_factory import OpenAICompatibleChatLLMService
-from utils.llm_utils import log_llm_json_result
 
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ async def rewrite_query_node(state: GraphState) -> Command:
         max_tokens=5000,
     )
     resp = await client.complete(req)
-    log_llm_json_result(logger, resp, prefix="[rewrite_query]")
+    # log_llm_json_result(logger, resp, prefix="[rewrite_query]")
 
     raw_text = (resp.raw_text or "").strip()
     if raw_text.startswith("```"):

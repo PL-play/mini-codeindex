@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import unittest
 
@@ -15,6 +16,7 @@ from mini_code_index.retrieval.util import (
     text_search_tool,
     tree_summary_tool,
 )
+from mini_code_index.retrieval.util.common_tools import tavily_search
 
 
 def _pretty_json(raw_json: str) -> str:
@@ -77,6 +79,14 @@ class TestLocalSearchTools(unittest.TestCase):
     def test_language_stats_tool(self) -> None:
         result = asyncio.run(language_stats_tool(str(self.test_code_dir)))
         print("language_stats_tool result:\n", _pretty_json(result))
+
+
+    def test_tavily_tool(self) -> None:
+        if not os.getenv("TAVILY_SEARCH_API_KEY", "").strip():
+            self.skipTest("TAVILY_SEARCH_API_KEY not set; skipping network Tavily test")
+        key = "trump trade war"
+        result = asyncio.run(tavily_search.ainvoke({"queries": [key]}))
+        print("test_tavily_tool result:\n", result)
 
 
 if __name__ == "__main__":
