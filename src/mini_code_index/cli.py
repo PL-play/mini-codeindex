@@ -2,87 +2,58 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
-import sys
+from pathlib import Path
 
-from .chunking import Config as ChunkConfig
-from .db import ChromaStore
-from .embedding import OpenAICompatibleEmbedder
-from .indexing import IndexConfig, index_directory
+from .retrieval.agent_graph import build_retrieval_agent_graph
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mini-code-index")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    idx = sub.add_parser("index", help="Index a directory (scan -> chunk -> embed -> store)")
-    idx.add_argument("root", help="Root directory to index")
-    idx.add_argument(
-        "--chroma-url",
-        default=os.environ.get("CHROMA_URL", "http://127.0.0.1:8010"),
-        help="ChromaDB base URL (default: %(default)s)",
-    )
-    idx.add_argument(
-        "--write",
-        action="store_true",
-        help="Actually write to the vector store (default is dry-run)",
-    )
-    idx.add_argument(
-        "--chunk-size",
+    p.add_argument("root_dir", help="Root directory to retrieve from")
+    p.add_argument("query", help="User query")
+    p.add_argument("--max-iterations", type=int, default=2, help="Max retrieval rounds (default: %(default)s)")
+    p.add_argument(
+        "--max-tool-call-iterations",
         type=int,
-        default=ChunkConfig().chunk_size,
-        help="Chunk size (default: %(default)s)",
+        default=8,
+        help="Max tool loop iterations (default: %(default)s)",
     )
-    idx.add_argument(
-        "--overlap",
-        type=float,
-        default=ChunkConfig().overlap_ratio,
-        help="Overlap ratio (default: %(default)s)",
+    p.add_argument(
+        "--recursion-limit",
+        type=int,
+        default=80,
+        help="LangGraph recursion limit (default: %(default)s)",
     )
-    idx.add_argument(
-        "--mode",
-        default=ChunkConfig().mode,
-        help="Chunking mode: file/type/function/auto_ast (default: %(default)s)",
+    p.add_argument(
+        "--output",
+        type=str,
+        default="",
+        help="Optional output markdown file path",
     )
-
-    ping = sub.add_parser("ping", help="Ping the configured ChromaDB")
-    ping.add_argument(
-        "--chroma-url",
-        default=os.environ.get("CHROMA_URL", "http://127.0.0.1:8010"),
-        help="ChromaDB base URL (default: %(default)s)",
-    )
-
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    graph = build_retrieval_agent_graph()
 
-    if args.cmd == "ping":
-        store = ChromaStore(base_url=args.chroma_url)
-        ok = asyncio.run(store.ping())
-        print("ok" if ok else "failed")
-        return 0 if ok else 1
-
-    if args.cmd == "index":
-        chunk_cfg = ChunkConfig(chunk_size=args.chunk_size, overlap_ratio=args.overlap, mode=args.mode)
-        cfg = IndexConfig(root_dir=args.root, dry_run=not args.write)
-
-        store = ChromaStore(base_url=args.chroma_url, root_dir=args.root)
-        if not asyncio.run(store.ping()):
-            print(f"ChromaDB is not reachable at {args.chroma_url}", file=sys.stderr)
-            return 2
-
-        embedder = None
-        if args.write:
-            embedder = OpenAICompatibleEmbedder.from_env()
-
-        stats = asyncio.run(
-            index_directory(cfg=cfg, chunk_cfg=chunk_cfg, embedder=embedder, store=store)
+    async def _run() -> dict:
+        return await graph.ainvoke(
+            {
+                "query": args.query,
+                "root_dir": str(Path(args.root_dir).resolve()),
+                "max_iterations": args.max_iterations,
+                "max_tool_call_iterations": args.max_tool_call_iterations,
+            },
+            {"recursion_limit": args.recursion_limit},
         )
-        print(
-            f"files_seen={stats.files_seen} files_indexed={stats.files_indexed} chunks={stats.chunks_emitted} dry_run={cfg.dry_run}"
-        )
-        return 0
 
-    return 1
+    result = asyncio.run(_run())
+    answer = ""
+    if isinstance(result, dict):
+        answer = str(result.get("answer") or result.get("final_answer") or "")
+    if args.output:
+        Path(args.output).write_text(answer, encoding="utf-8")
+    else:
+        print(answer)
+    return 0
