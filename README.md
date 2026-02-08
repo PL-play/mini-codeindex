@@ -143,6 +143,13 @@ SYNTHESIZER_MODEL=...
 python -m pytest tests/test_retrieval_agent_graph.py -k test_batch_questions_write_md -s
 ```
 
+2.5) 命令行检索（推荐）
+```
+python -m mini_code_index.cli <root_dir> "<query>" \
+  --max-iterations 2 --max-tool-call-iterations 8 --recursion-limit 80 \
+  --output result.md
+```
+
 3) 向量化索引（示意）
 ```
 python -c "from mini_code_index.vectorise import IndexConfig, index_directory; index_directory(IndexConfig(root_dir='YOUR_REPO'))"
