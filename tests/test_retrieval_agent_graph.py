@@ -14,7 +14,7 @@ class TestRetrievalAgentGraph(unittest.TestCase):
 
     def test_batch_questions_write_md(self) -> None:
         graph = build_retrieval_agent_graph()
-        root_dir = "/test/mini_code_index/test_code_index_project"
+        root_dir = str(Path(__file__).resolve().parent.parent / "test_code_index_project")
         questions = [
             "这个项目的主要目的是什么？它的核心功能有哪些？",
             "项目里有哪些主要模块（Java 和 Python 各自有哪些关键文件/目录）？",
