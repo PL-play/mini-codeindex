@@ -98,7 +98,7 @@ def _result_summary(result: Any) -> str:
     return f"<{type(result).__name__}>"
 
 
-def _tool_call_note(name: str, args: Any, result: Any, meta: Optional[Dict[str, Any]] = None) -> str:
+def _tool_call_note(name: str, args: Any, result: Any, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "tool": name,
         "args": args,
@@ -106,11 +106,49 @@ def _tool_call_note(name: str, args: Any, result: Any, meta: Optional[Dict[str, 
     }
     if meta:
         payload.update(meta)
+    return payload
+
+
+def _normalize_note_payload(note: Any) -> Any:
+    if isinstance(note, dict):
+        return note
+    if not isinstance(note, str):
+        return note
+    s = note.strip()
     try:
-        text = json.dumps(payload, ensure_ascii=False, default=str)
+        first = json.loads(s)
     except Exception:
-        text = str(payload)
-    return _truncate(text, 2000)
+        return note
+    if isinstance(first, str):
+        inner = first.strip()
+        if inner.startswith("{") or inner.startswith("["):
+            try:
+                return json.loads(inner)
+            except Exception:
+                return first
+    return first
+
+
+def _normalize_result_payload(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s:
+        return value
+    if not (s.startswith("{") or s.startswith("[") or s.startswith('"')):
+        return value
+    try:
+        first = json.loads(s)
+    except Exception:
+        return value
+    if isinstance(first, str):
+        inner = first.strip()
+        if inner.startswith("{") or inner.startswith("["):
+            try:
+                return json.loads(inner)
+            except Exception:
+                return first
+    return first
 
 
 def _safe_filename(value: str, *, prefix: str = "subtask", max_len: int = 60) -> str:
@@ -393,7 +431,6 @@ async def task_tools_node(state: SubtaskState) -> Command:
                         {"tool_iter": int(state.get("tool_call_iterations", 0)), "call_index": idx},
                     )
                 )
-        notes.append("retrieval_complete_requested")
         tool_messages = tool_messages_from_observations(
             tool_calls=executed_calls,
             observations=observations,
@@ -460,7 +497,6 @@ async def task_tools_node(state: SubtaskState) -> Command:
 
         observations.append(obs)
         executed_calls.append(tc)
-        notes.append(_tool_call_note(name, args, obs, {"tool_iter": tool_iter, "call_index": idx}))
 
         if name == "think_tool":
             reflection_text = obs if isinstance(obs, str) else str(obs)
@@ -470,8 +506,16 @@ async def task_tools_node(state: SubtaskState) -> Command:
                     "content": f"[Think Reflection]\n{reflection_text}",
                 }
             )
-            notes.append(_tool_call_note("think_tool_reflection", {"reflection": args.get("reflection")}, reflection_text))
+            notes.append(
+                _tool_call_note(
+                    "think_tool_reflection",
+                    {"reflection": args.get("reflection")},
+                    reflection_text,
+                    {"tool_iter": tool_iter, "call_index": idx},
+                )
+            )
         else:
+            notes.append(_tool_call_note(name, args, obs, {"tool_iter": tool_iter, "call_index": idx}))
             non_think_tool_called = True
 
     tool_messages = tool_messages_from_observations(
@@ -504,25 +548,37 @@ async def synthesize_node(state: SubtaskState) -> Command:
     instruction = str(sub_task.get("instruction", "") or "").strip()
     notes = list(state.get("notes") or [])
 
-    tool_blocks: List[str] = []
-    think_blocks: List[str] = []
-    extra_notes: List[str] = []
+    rendered_items: List[str] = []
+    tool_count = 0
     for note in notes:
-        if not isinstance(note, str):
-            extra_notes.append(str(note))
+        payload = _normalize_note_payload(note)
+
+        if isinstance(payload, dict):
+            if payload.get("note") == "retrieval_complete_requested":
+                continue
+            if payload.get("tool") in {"think_tool", "think_tool_reflection"}:
+                reflection = payload.get("result")
+                rendered_items.append("### Think Reflection")
+                rendered_items.append(str(reflection or ""))
+                rendered_items.append("")
+                continue
+            if "result" in payload:
+                payload = dict(payload)
+                payload["result"] = _normalize_result_payload(payload.get("result"))
+            tool_count += 1
+            rendered_items.append(f"### Call {tool_count}")
+            rendered_items.append("```json")
+            rendered_items.append(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+            rendered_items.append("```")
+            rendered_items.append("")
             continue
-        try:
-            payload = json.loads(note)
-            if isinstance(payload, dict):
-                if payload.get("tool") in {"think_tool", "think_tool_reflection"}:
-                    think_blocks.append(json.dumps(payload, ensure_ascii=False, indent=2))
-                    continue
-                pretty = json.dumps(payload, ensure_ascii=False, indent=2)
-                tool_blocks.append(pretty)
-            else:
-                extra_notes.append(note)
-        except Exception:
-            extra_notes.append(note)
+
+        rendered_items.append(f"### Call {tool_count + 1}")
+        rendered_items.append("```json")
+        rendered_items.append(json.dumps({"note": payload}, ensure_ascii=False, indent=2, default=str))
+        rendered_items.append("```")
+        rendered_items.append("")
+        tool_count += 1
 
     lines: List[str] = [
         "# Subtask Debug Report",
@@ -532,26 +588,10 @@ async def synthesize_node(state: SubtaskState) -> Command:
         "",
         "## Tool Calls",
     ]
-    if tool_blocks:
-        for idx, block in enumerate(tool_blocks, start=1):
-            lines.append(f"### Call {idx}")
-            lines.append("```json")
-            lines.append(block)
-            lines.append("```")
-            lines.append("")
+    if rendered_items:
+        lines.extend(rendered_items)
     else:
         lines.append("- (none)")
-
-    if think_blocks:
-        lines.append("## Think Reflection")
-        for block in think_blocks:
-            lines.append(block)
-        lines.append("")
-
-    if extra_notes:
-        lines.append("## Notes")
-        for note in extra_notes:
-            lines.append(f"- {note}")
 
     report = "\n".join(lines).rstrip()
     logger.info("%s synthesize_report\n%s", prefix, report)
