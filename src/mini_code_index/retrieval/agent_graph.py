@@ -929,22 +929,25 @@ def main() -> None:
 
     This outputs a PNG diagram when supported; otherwise falls back to Mermaid markdown.
     """
-    compiled = build_retrieval_agent_graph()
-    subtask_compiled = build_subtask_graph()
     try:
-        graph = compiled.get_graph()
+        subtask_compiled = build_subtask_graph()
+        viz_graph = StateGraph(RetrievalAgentState)
+        viz_graph.add_node("planner", planner_node)
+        viz_graph.add_node("run_subtasks", subtask_compiled)
+        viz_graph.add_node("summarize", summarize_node)
+
+        viz_graph.set_entry_point("planner")
+        viz_graph.add_edge("planner", "run_subtasks")
+        viz_graph.add_edge("run_subtasks", "summarize")
+        viz_graph.add_edge("summarize", END)
+
+        compiled_viz = viz_graph.compile()
+        graph = compiled_viz.get_graph(xray=1)
         png_bytes = graph.draw_mermaid_png()
-        output_path = "retrieval_agent_graph.png"
+        output_path = "retrieval_full_graph.png"
         with open(output_path, "wb") as f:
             f.write(png_bytes)
         print(f"Wrote graph visualization to {output_path}")
-
-        sub_graph = subtask_compiled.get_graph()
-        sub_png = sub_graph.draw_mermaid_png()
-        sub_output_path = "retrieval_subtask_graph.png"
-        with open(sub_output_path, "wb") as f:
-            f.write(sub_png)
-        print(f"Wrote subtask graph visualization to {sub_output_path}")
         return
     except Exception:
         mermaid = (
@@ -968,7 +971,7 @@ def main() -> None:
             "  verify --> task_agent\n"
         )
 
-    output_path = "retrieval_agent_graph.md"
+    output_path = "retrieval_full_graph.md"
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("```mermaid\n")
         f.write(mermaid)
