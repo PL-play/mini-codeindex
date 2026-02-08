@@ -148,10 +148,46 @@ python -m pytest tests/test_retrieval_agent_graph.py -k test_batch_questions_wri
 python -c "from mini_code_index.vectorise import IndexConfig, index_directory; index_directory(IndexConfig(root_dir='YOUR_REPO'))"
 ```
 
+## 从测试入手（调试与运行）
+
+### 1) 检索 Agent 测试
+`tests/test_retrieval_agent_graph.py` 会批量提问并生成结果文件：
+```
+python -m pytest tests/test_retrieval_agent_graph.py -k test_batch_questions_write_md -s
+```
+输出文件示例：
+- `tests/batch_retrieval_q1.md` ~ `tests/batch_retrieval_q5.md`
+
+### 2) 分块与索引调试（捕获 chunks）
+`tests/test_indexing_smoke.py::test_index_directory_capture_chunks_to_file`  
+会把 chunk 输出到 `captured_chunks.txt`，便于检查分块策略：
+```
+python -m pytest tests/test_indexing_smoke.py -k test_index_directory_capture_chunks_to_file -s
+```
+
+### 3) 全流程索引（真实向量服务）
+`tests/test_indexing_smoke.py::test_full_pipeline_with_real_services`  
+需要配置 ChromaDB 与 embedding：
+```
+python -m pytest tests/test_indexing_smoke.py -k test_full_pipeline_with_real_services -s
+```
+
+## 环境变量（.env.example）
+
+建议复制 `.env.example` 并补齐以下关键配置：
+- **Embedding**：`EMBEDDING_MODEL`, `EMBEDDING_DIM`, `EMBEDDING_BINDING_HOST`, `EMBEDDING_BINDING_API_KEY`
+- **ChromaDB**：`CHROMADB_HOST`
+- **Planner**：`PLANNER_BASE_URL`, `PLANNER_API_KEY`, `PLANNER_MODEL`
+- **Task Agent**：`TASK_AGENT_BASE_URL`, `TASK_AGENT_API_KEY`, `TASK_AGENT_MODEL`
+- **Synthesizer**：`SYNTHESIZER_BASE_URL`, `SYNTHESIZER_API_KEY`, `SYNTHESIZER_MODEL`
+- **(可选) 查询改写**：`REWRITE_*`
+- **(可选) Web 搜索**：`TAVILY_SEARCH_API_KEY`
+- **(可选) 网页摘要**：`SUMMARY_*`
+
 ## 项目结构（关键目录）
 - `src/mini_code_index/retrieval/`：检索 Agent 图与工具
 - `src/mini_code_index/chunking.py`：分块策略
 - `src/mini_code_index/indexing.py`：向量化索引入口
 
 ## License
-MIT（或按需替换）
+MIT
