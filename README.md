@@ -104,6 +104,14 @@ task_agent -> task_tools -> (task_agent | synthesize) -> verify -> (task_agent |
 
 这些元信息被写入向量索引，支持按“结构语义 + 位置”检索。
 
+#### 元数据的作用（更细节）
+- **scope_path / contained_scopes**：保留“文件 → 类型 → 函数”的层级关系，帮助定位上下文语义  
+- **scope_start / scope_end**：标注作用域级别的范围，用于更精确的引用/对齐  
+- **start / end**：chunk 本身的精确位置（行列），便于生成可点击引用  
+- **group_id / group_index**：同一作用域被切成多个 chunk 时的分组与顺序，便于回拼  
+- **chunk_kind / mode**：标记 chunk 类型与分块策略（code/comment/trivia 与 file/type/function/auto_ast）  
+- **symbol_names / scope_depth**：利于快速过滤目标函数/类型并加速语义检索  
+
 ### 4. 文件过滤与文本检测
 索引前会执行：
 - 二进制扩展过滤
