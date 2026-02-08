@@ -36,3 +36,4 @@ htmlcov/
 docker/chromadb/chroma_data
 test_code_index_project
 refs
+*.log
