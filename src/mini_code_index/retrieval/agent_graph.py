@@ -262,6 +262,13 @@ def _load_synthesize_config() -> OpenAICompatibleChatConfig:
         model=_require_env("SYNTHESIZER_MODEL"),
     )
 
+def _load_summarize_config() -> OpenAICompatibleChatConfig:
+    return OpenAICompatibleChatConfig(
+        base_url=_require_env("SUMMARIZE_BASE_URL"),
+        api_key=_require_env("SUMMARIZE_API_KEY"),
+        model=_require_env("SUMMARIZE_MODEL"),
+    )
+
 
 def _task_tools() -> List[Any]:
     return [
@@ -297,15 +304,17 @@ async def planner_node(state: RetrievalAgentState) -> Command:
 
     cfg = _load_planner_config()
     client = OpenAICompatibleChatLLMService(cfg)
-
-    req = LLMRequest.from_prompt(
-        prompt=query,
-        system_prompt=planner_system_prompt,
-        parse_json=True,
-        temperature=0.0,
-        max_tokens=4000,
-    )
-    resp = await client.complete(req)
+    try:
+        req = LLMRequest.from_prompt(
+            prompt=query,
+            system_prompt=planner_system_prompt,
+            parse_json=True,
+            temperature=0.0,
+            max_tokens=4000,
+        )
+        resp = await client.complete(req)
+    finally:
+        await client.close()
     # log_llm_json_result(logger, resp, prefix="[planner]")
 
     if resp.parse_error or not resp.json_data:
@@ -350,7 +359,7 @@ async def task_agent_node(state: SubtaskState) -> Command:
     prefix = _log_prefix("task_agent", dict(state))
     logger.info("++++++++++ task_agent node start ++++++++++ %s", prefix)
 
-    cfg = _load_synthesize_config()
+    cfg = _load_task_agent_config()
     client = OpenAICompatibleChatLLMService(cfg)
     bound = bind_tools(client, _task_tools())
 
@@ -371,7 +380,10 @@ async def task_agent_node(state: SubtaskState) -> Command:
         temperature=0.0,
         max_tokens=8000,
     )
-    resp = await bound.complete(req)
+    try:
+        resp = await bound.complete(req)
+    finally:
+        await client.close()
     tool_calls = resp.get_tool_calls()
 
     logger.info("%s llm_done tool_calls=%d", prefix, len(tool_calls))
@@ -425,7 +437,14 @@ async def task_tools_node(state: SubtaskState) -> Command:
     if not tool_calls:
         return Command(update={"last_step_had_tool_calls": False})
 
-    logger.info("%s start tool_calls=%d", prefix, len(tool_calls))
+    logger.info(
+        "%s start tool_calls=%d last_step_had_tool_calls=%s tool_iter=%s think_iter=%s",
+        prefix,
+        len(tool_calls),
+        bool(state.get("last_step_had_tool_calls")),
+        int(state.get("tool_call_iterations", 0)),
+        int(state.get("think_tool_iterations", 0)),
+    )
 
     completion_tool_names = {"RetrievalComplete", "ResearchComplete", "ResearchCompleted"}
     has_completion = any(tc.get("name") in completion_tool_names for tc in tool_calls)
@@ -470,7 +489,7 @@ async def task_tools_node(state: SubtaskState) -> Command:
 
     tool_iter = int(state.get("tool_call_iterations", 0))
     non_think_tool_called = False
-    extra_messages: List[Dict[str, Any]] = []
+    think_tool_called = False
     tool_iter = int(state.get("tool_call_iterations", 0))
     for idx, tc in enumerate(tool_calls, start=1):
         name = str(tc.get("name") or "").strip()
@@ -519,13 +538,8 @@ async def task_tools_node(state: SubtaskState) -> Command:
         executed_calls.append(tc)
 
         if name == "think_tool":
+            think_tool_called = True
             reflection_text = obs if isinstance(obs, str) else str(obs)
-            extra_messages.append(
-                {
-                    "role": "user",
-                    "content": f"[Think Reflection]\n{reflection_text}",
-                }
-            )
             notes.append(
                 _tool_call_note(
                     "think_tool_reflection",
@@ -543,12 +557,29 @@ async def task_tools_node(state: SubtaskState) -> Command:
         observations=observations,
     )
 
+    next_think_iters = int(state.get("think_tool_iterations", 0))
+    if think_tool_called and not non_think_tool_called:
+        next_think_iters += 1
+    else:
+        next_think_iters = 0
+
+    should_loop = True
+
+    logger.info(
+        "%s tool_loop_state next_last_step=%s next_tool_iter=%s next_think_iter=%s",
+        prefix,
+        should_loop,
+        int(state.get("tool_call_iterations", 0)) + 1,
+        next_think_iters,
+    )
+
     return Command(
         update={
-            "messages": [*tool_messages, *extra_messages],
+            "messages": tool_messages,
             "notes": notes,
-            "last_step_had_tool_calls": True,
-            "tool_call_iterations": int(state.get("tool_call_iterations", 0)) + (1 if non_think_tool_called else 0),
+            "last_step_had_tool_calls": should_loop,
+            "tool_call_iterations": int(state.get("tool_call_iterations", 0)) + 1,
+            "think_tool_iterations": next_think_iters,
         }
     )
 
@@ -616,21 +647,24 @@ async def synthesize_node(state: SubtaskState) -> Command:
     report = "\n".join(lines).rstrip()
     logger.info("%s synthesize_report\n%s", prefix, report)
 
-    cfg = _load_task_agent_config()
+    cfg = _load_synthesize_config()
     client = OpenAICompatibleChatLLMService(cfg)
-    synth_prompt = (
-        f"Subtask Title: {name or '(empty)'}\n"
-        f"Instruction: {instruction or '(empty)'}\n\n"
-        f"Debug Report:\n{report}"
-    )
-    req = LLMRequest.from_prompt(
-        prompt=synth_prompt,
-        system_prompt=subtask_synthesize_system_prompt,
-        parse_json=True,
-        temperature=0.0,
-        max_tokens=4096,
-    )
-    resp = await client.complete(req)
+    try:
+        synth_prompt = (
+            f"Subtask Title: {name or '(empty)'}\n"
+            f"Instruction: {instruction or '(empty)'}\n\n"
+            f"Debug Report:\n{report}"
+        )
+        req = LLMRequest.from_prompt(
+            prompt=synth_prompt,
+            system_prompt=subtask_synthesize_system_prompt,
+            parse_json=True,
+            temperature=0.0,
+            max_tokens=4096,
+        )
+        resp = await client.complete(req)
+    finally:
+        await client.close()
 
     result_dict: Optional[Dict[str, Any]] = None
     if resp.parse_error or not resp.json_data:
@@ -720,26 +754,29 @@ async def summarize_node(state: RetrievalAgentState) -> Command:
             }
         )
 
-    cfg = _load_synthesize_config()
+    cfg = _load_summarize_config()
     client = OpenAICompatibleChatLLMService(cfg)
-    summary_prompt = (
-        f"User Query: {query or '(empty)'}\n\n"
-        f"Subtask Bundles:\n{json.dumps(bundles, ensure_ascii=False, indent=2, default=str)}"
-    )
-    req = LLMRequest.from_prompt(
-        prompt=summary_prompt,
-        system_prompt=summarize_system_prompt,
-        parse_json=False,
-        temperature=0.0,
-        max_tokens=32000,
-    )
+    try:
+        summary_prompt = (
+            f"User Query: {query or '(empty)'}\n\n"
+            f"Subtask Bundles:\n{json.dumps(bundles, ensure_ascii=False, indent=2, default=str)}"
+        )
+        req = LLMRequest.from_prompt(
+            prompt=summary_prompt,
+            system_prompt=summarize_system_prompt,
+            parse_json=False,
+            temperature=0.0,
+            max_tokens=32000,
+        )
 
-    parts: List[str] = []
-    async for chunk in client.stream(req):
-        if chunk.delta_text:
-            print(f"\033[31m{chunk.delta_text}\033[0m", end="", flush=True)
-            parts.append(chunk.delta_text)
-    final_text = "".join(parts).strip()
+        parts: List[str] = []
+        async for chunk in client.stream(req):
+            if chunk.delta_text:
+                print(f"\033[31m{chunk.delta_text}\033[0m", end="", flush=True)
+                parts.append(chunk.delta_text)
+        final_text = "".join(parts).strip()
+    finally:
+        await client.close()
     if final_text:
         logger.info("[summarize] final_text %s \n\n", _truncate(final_text, 1200))
     else:
@@ -857,6 +894,7 @@ async def run_subtasks_node(state: RetrievalAgentState) -> Command:
                 "max_iterations": max_iterations,
                 "tool_call_iterations": 0,
                 "max_tool_call_iterations": max_tool_call_iterations,
+                "think_tool_iterations": 0,
                 "last_step_had_tool_calls": False,
                 "next_sub_task": None,
                 "root_dir": root_dir,

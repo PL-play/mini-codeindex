@@ -130,6 +130,10 @@ Stop early when:
 Use think_tool sparingly and briefly:
 - Before your first action: plan which evidence is needed.
 - After a burst of tool results: assess what you have and what is missing.
+Hard limits:
+- Do NOT call think_tool twice in a row.
+- Do NOT call think_tool if the previous step already used think_tool.
+- If you use think_tool, your next action MUST be a non-think tool call or RetrievalComplete.
 
 Remember: think_tool must be used alone.
 </Think Tool Guidance>

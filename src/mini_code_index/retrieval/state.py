@@ -130,6 +130,7 @@ class SubtaskState(TypedDict):
     tool_call_iterations: int
     max_tool_call_iterations: int
     last_step_had_tool_calls: bool
+    think_tool_iterations: int
 
     # Retrieval rounds control (across verify -> possible next retrieval round)
     iteration: int
