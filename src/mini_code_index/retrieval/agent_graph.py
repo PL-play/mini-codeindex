@@ -376,6 +376,8 @@ async def task_tools_node(state: SubtaskState) -> Command:
     executed_calls: List[Dict[str, Any]] = []
     notes: List[str] = []
 
+    root_dir = str(state.get("root_dir", "") or "").strip()
+
     if has_completion:
         logger.info("%s completion_requested", prefix)
         for idx, tc in enumerate(tool_calls, start=1):
@@ -410,12 +412,32 @@ async def task_tools_node(state: SubtaskState) -> Command:
         logger.warning("%s think_tool_parallel_violation", prefix)
 
     tool_iter = int(state.get("tool_call_iterations", 0))
+    non_think_tool_called = False
+    extra_messages: List[Dict[str, Any]] = []
+    tool_iter = int(state.get("tool_call_iterations", 0))
     for idx, tc in enumerate(tool_calls, start=1):
         name = str(tc.get("name") or "").strip()
         args = tc.get("args") or {}
         if name == "think_tool" and "reflection" not in args and "tool_input" in args:
             args = dict(args)
             args["reflection"] = args.get("tool_input")
+        if name in {
+            "text_search_tool",
+            "path_glob_tool",
+            "tree_summary_tool",
+            "symbol_index_tool",
+            "find_references_tool",
+            "language_stats_tool",
+            "code_vector_search_tool",
+        }:
+            if root_dir and not args.get("root_dir"):
+                args = dict(args)
+                args["root_dir"] = root_dir
+        if name in {"read_file_range_tool", "file_metadata_tool"}:
+            path = str(args.get("path") or "").strip()
+            if path and not os.path.isabs(path) and root_dir:
+                args = dict(args)
+                args["path"] = os.path.join(root_dir, path)
         logger.info("%s tool_execute name=%s args=%s", prefix, name, _tool_args_summary(args))
         spec = task_tool_reg.get(name)
         if spec is None:
@@ -441,7 +463,16 @@ async def task_tools_node(state: SubtaskState) -> Command:
         notes.append(_tool_call_note(name, args, obs, {"tool_iter": tool_iter, "call_index": idx}))
 
         if name == "think_tool":
-            notes.append("think_tool_used")
+            reflection_text = obs if isinstance(obs, str) else str(obs)
+            extra_messages.append(
+                {
+                    "role": "user",
+                    "content": f"[Think Reflection]\n{reflection_text}",
+                }
+            )
+            notes.append(_tool_call_note("think_tool_reflection", {"reflection": args.get("reflection")}, reflection_text))
+        else:
+            non_think_tool_called = True
 
     tool_messages = tool_messages_from_observations(
         tool_calls=executed_calls,
@@ -450,10 +481,10 @@ async def task_tools_node(state: SubtaskState) -> Command:
 
     return Command(
         update={
-            "messages": tool_messages,
+            "messages": [*tool_messages, *extra_messages],
             "notes": notes,
             "last_step_had_tool_calls": True,
-            "tool_call_iterations": int(state.get("tool_call_iterations", 0)) + 1,
+            "tool_call_iterations": int(state.get("tool_call_iterations", 0)) + (1 if non_think_tool_called else 0),
         }
     )
 
@@ -474,6 +505,7 @@ async def synthesize_node(state: SubtaskState) -> Command:
     notes = list(state.get("notes") or [])
 
     tool_blocks: List[str] = []
+    think_blocks: List[str] = []
     extra_notes: List[str] = []
     for note in notes:
         if not isinstance(note, str):
@@ -482,6 +514,9 @@ async def synthesize_node(state: SubtaskState) -> Command:
         try:
             payload = json.loads(note)
             if isinstance(payload, dict):
+                if payload.get("tool") in {"think_tool", "think_tool_reflection"}:
+                    think_blocks.append(json.dumps(payload, ensure_ascii=False, indent=2))
+                    continue
                 pretty = json.dumps(payload, ensure_ascii=False, indent=2)
                 tool_blocks.append(pretty)
             else:
@@ -506,6 +541,12 @@ async def synthesize_node(state: SubtaskState) -> Command:
             lines.append("")
     else:
         lines.append("- (none)")
+
+    if think_blocks:
+        lines.append("## Think Reflection")
+        for block in think_blocks:
+            lines.append(block)
+        lines.append("")
 
     if extra_notes:
         lines.append("## Notes")
@@ -656,7 +697,7 @@ async def run_subtasks_node(state: RetrievalAgentState) -> Command:
         return Command(update={"sub_results": [], "notes": "no_subtasks"})
 
     max_iterations = int(state.get("max_iterations", 2))
-    max_tool_call_iterations = int(state.get("max_tool_call_iterations", 5))
+    max_tool_call_iterations = int(state.get("max_tool_call_iterations", 10))
 
     async def _run_one(task: Dict[str, Any]) -> Dict[str, Any]:
         return await subtask_graph.ainvoke(

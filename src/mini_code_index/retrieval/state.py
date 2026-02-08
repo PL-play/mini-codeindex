@@ -24,6 +24,7 @@ class RetrievalAgentState(TypedDict, total=False):
     needs_more: bool
     iteration: int
     max_iterations: int
+    max_tool_call_iterations: int
     notes: str
 
 class RetrievalPlan(BaseModel):

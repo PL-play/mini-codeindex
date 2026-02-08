@@ -23,7 +23,8 @@ class TestRetrievalAgentGraph(unittest.TestCase):
         root_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
         try:
             result = asyncio.run(
-                graph.ainvoke({"query": query, "root_dir": root_dir, "max_iterations": 2})
+                graph.ainvoke(
+                    {"query": query, "root_dir": root_dir, "max_iterations": 2, "max_tool_call_iterations": 10})
             )
             print("graph run result:", result)
         except Exception as exc:
