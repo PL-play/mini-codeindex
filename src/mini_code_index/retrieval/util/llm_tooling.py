@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Type, Union, get_args, get_origin
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Type, Union, get_args, get_origin, get_type_hints
 
 from .interface import LLMService, LLMRequest, LLMResponse, LLMMessage, LLMTool
 
@@ -198,9 +198,13 @@ def schema_from_callable(fn: Any) -> Dict[str, Any]:
     """
     sig = inspect.signature(fn)
     try:
-        hints = getattr(fn, "__annotations__", {}) or {}
+        # Resolve annotations (handles `from __future__ import annotations`).
+        hints = get_type_hints(fn)
     except Exception:
-        hints = {}
+        try:
+            hints = getattr(fn, "__annotations__", {}) or {}
+        except Exception:
+            hints = {}
 
     properties: Dict[str, Any] = {}
     required: List[str] = []
@@ -276,7 +280,11 @@ def tool_spec_from(
     # callable (function / instance with __call__)
     if callable(obj):
         target = obj
-        spec_name = str(name or getattr(obj, "__name__", obj.__class__.__name__))
+        if name:
+            spec_name = str(name)
+        else:
+            tool_name = getattr(obj, "name", None)
+            spec_name = str(tool_name) if tool_name else str(getattr(obj, "__name__", obj.__class__.__name__))
         # Merge explicit description + docstring (both matter).
         doc = (inspect.getdoc(obj) or "").strip()
         desc = (description or "").strip()
@@ -433,13 +441,130 @@ def tool_messages_from_observations(
     return msgs
 
 
+def _coerce_scalar(expected_type: Optional[str], value: Any) -> Any:
+    if expected_type is None:
+        return value
+
+    # Keep None as-is.
+    if value is None:
+        return None
+
+    # Integer
+    if expected_type == "integer":
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            s = value.strip()
+            try:
+                # Handles "10" and also "10.0" best-effort.
+                return int(float(s))
+            except Exception:
+                return value
+        return value
+
+    # Number
+    if expected_type == "number":
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str):
+            s = value.strip()
+            try:
+                return float(s)
+            except Exception:
+                return value
+        return value
+
+    # Boolean
+    if expected_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            s = value.strip().lower()
+            if s in {"true", "t", "1", "yes", "y", "on"}:
+                return True
+            if s in {"false", "f", "0", "no", "n", "off"}:
+                return False
+        return value
+
+    # String
+    if expected_type == "string":
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    return value
+
+
+def _expected_type_from_schema(schema: Any) -> Optional[str]:
+    if not isinstance(schema, dict):
+        return None
+
+    t = schema.get("type")
+    if isinstance(t, str):
+        return t
+
+    # Union-like shapes (best-effort)
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list) and any_of:
+        for opt in any_of:
+            et = _expected_type_from_schema(opt)
+            if et:
+                return et
+
+    one_of = schema.get("oneOf")
+    if isinstance(one_of, list) and one_of:
+        for opt in one_of:
+            et = _expected_type_from_schema(opt)
+            if et:
+                return et
+
+    return None
+
+
+def _coerce_args_by_schema(schema: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not isinstance(args, dict):
+        return args
+
+    out: Dict[str, Any] = dict(args)
+    for key, prop_schema in properties.items():
+        if key not in out:
+            continue
+        expected = _expected_type_from_schema(prop_schema)
+        v = out.get(key)
+
+        if expected == "array":
+            if isinstance(v, str):
+                s = v.strip()
+                # If the model gave a JSON array as a string, try parsing.
+                if s.startswith("[") and s.endswith("]"):
+                    try:
+                        parsed = json.loads(s)
+                        if isinstance(parsed, list):
+                            out[key] = parsed
+                            continue
+                    except Exception:
+                        pass
+            # Otherwise leave arrays as-is.
+            continue
+
+        # Scalar types
+        out[key] = _coerce_scalar(expected, v)
+    return out
+
+
 async def execute_tool_safely(tool: ToolSpec, args: Dict[str, Any]) -> Any:
     """
     Safely execute a tool with error handling.
     Mirrors the spirit of agent-psychology's execute_tool_safely, without LangChain dependency.
     """
     try:
-        return await tool.ainvoke(args)
+        coerced_args = _coerce_args_by_schema(dict(tool.parameters or {}), dict(args or {}))
+        return await tool.ainvoke(coerced_args)
     except Exception as e:
         return {"error": f"tool_error:{tool.name}: {e}"}
 

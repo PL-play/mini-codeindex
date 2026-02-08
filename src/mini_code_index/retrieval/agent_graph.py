@@ -10,7 +10,7 @@ _SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from mini_code_index.retrieval.util.interface import OpenAICompatibleChatConfig, LLMRequest
+from mini_code_index.retrieval.util.interface import OpenAICompatibleChatConfig, LLMRequest, LLMResponse
 
 
 """LangGraph-based retrieval agent workflow (skeleton).
@@ -21,18 +21,165 @@ left as placeholders (docstrings only) per requirement.
 """
 
 import asyncio
+import json
 import logging
+import re
+import time
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
-from mini_code_index.retrieval.prompts import planner_system_prompt
-from mini_code_index.retrieval.state import RetrievalPlan, RetrievalAgentState, SubtaskState
+from mini_code_index.retrieval.prompts import planner_system_prompt, task_agent_system_prompt
+from mini_code_index.retrieval.state import RetrievalPlan, RetrievalAgentState, RetrievalComplete, SubtaskState
 from mini_code_index.retrieval.util.llm_factory import OpenAICompatibleChatLLMService
 from mini_code_index.retrieval.util.llm_utils import log_llm_json_result
+from mini_code_index.retrieval.util.llm_tooling import (
+    ToolRegistry,
+    bind_tools,
+    execute_tool_safely,
+    extract_tool_calls,
+    tool_messages_from_observations,
+)
+from mini_code_index.retrieval.util.common_tools import think_tool
+from mini_code_index.retrieval.util.local_search import (
+    file_metadata_tool,
+    find_references_tool,
+    language_stats_tool,
+    path_glob_tool,
+    read_file_range_tool,
+    symbol_index_tool,
+    text_search_tool,
+    tree_summary_tool,
+)
+from mini_code_index.retrieval.util.vector_search import code_vector_search_tool
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate(s: str, max_len: int = 80) -> str:
+    s = str(s)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
+def _tool_args_summary(args: Any) -> str:
+    if not isinstance(args, dict):
+        return f"<{type(args).__name__}>"
+    parts: List[str] = []
+    for k in sorted(args.keys(), key=lambda x: str(x)):
+        v = args.get(k)
+        if isinstance(v, str):
+            parts.append(f"{k}={_truncate(v.replace(chr(10), ' '), 80)!r}")
+        elif isinstance(v, (int, float, bool)) or v is None:
+            parts.append(f"{k}={v!r}")
+        else:
+            parts.append(f"{k}=<{type(v).__name__}>")
+    return ", ".join(parts)
+
+
+def _result_summary(result: Any) -> str:
+    if result is None:
+        return "None"
+    if isinstance(result, str):
+        return _truncate(result.replace("\n", " "), 200)
+    if isinstance(result, bytes):
+        return f"<bytes len={len(result)}>"
+    if isinstance(result, list):
+        return f"<list len={len(result)}>"
+    if isinstance(result, dict):
+        keys = list(result.keys())
+        keys_preview = ",".join([str(k) for k in keys[:8]])
+        suffix = "..." if len(keys) > 8 else ""
+        if "error" in result:
+            return f"<dict keys={keys_preview}{suffix} error={_truncate(str(result.get('error')), 120)!r}>"
+        return f"<dict keys={keys_preview}{suffix}>"
+    return f"<{type(result).__name__}>"
+
+
+def _tool_call_note(name: str, args: Any, result: Any, meta: Optional[Dict[str, Any]] = None) -> str:
+    payload: Dict[str, Any] = {
+        "tool": name,
+        "args": args,
+        "result": result,
+    }
+    if meta:
+        payload.update(meta)
+    try:
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(payload)
+    return _truncate(text, 2000)
+
+
+def _safe_filename(value: str, *, prefix: str = "subtask", max_len: int = 60) -> str:
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", (value or "").strip()).strip("_").lower()
+    if not base:
+        base = "untitled"
+    base = base[:max_len]
+    return f"{prefix}_{base}.md"
+
+
+def _tool_calls_brief(tool_calls: Any) -> str:
+    if not isinstance(tool_calls, list):
+        return f"<{type(tool_calls).__name__}>"
+    parts: List[str] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            parts.append(f"<{type(tc).__name__}>"
+            )
+            continue
+        name = str(tc.get("name") or "")
+        args = tc.get("args") or {}
+        parts.append(f"{name}({ _tool_args_summary(args) })")
+    return "; ".join(parts)
+
+
+def _log_prefix(node: str, state: Dict[str, Any]) -> str:
+    task = asyncio.current_task()
+    atask = "no-task"
+    if task is not None:
+        try:
+            atask = task.get_name()
+        except Exception:
+            atask = f"task@{id(task)}"
+
+    iteration = int(state.get("iteration", 0) or 0)
+    tool_iter = int(state.get("tool_call_iterations", 0) or 0)
+
+    sub_task = state.get("sub_task") or {}
+    sub_name = _truncate(str(sub_task.get("name", "") or "").strip(), 60)
+
+    return f"[{node} atask={atask} iter={iteration} tool_iter={tool_iter} subtask={sub_name!r}]"
+
+
+def _messages_summary(messages: List[Any], max_len: int = 600) -> str:
+    if not messages:
+        return "<empty>"
+    parts: List[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            parts.append(f"<{type(msg).__name__}>")
+            continue
+        role = msg.get("role") or "unknown"
+        content = msg.get("content")
+        tool_call_id = msg.get("tool_call_id")
+        tool_calls = msg.get("tool_calls")
+        content_preview = ""
+        if isinstance(content, str):
+            content_preview = _truncate(content.replace("\n", " "), 120)
+        elif content is not None:
+            content_preview = f"<{type(content).__name__}>"
+        tool_calls_count = len(tool_calls) if isinstance(tool_calls, list) else (1 if tool_calls else 0)
+        extra = []
+        if tool_call_id:
+            extra.append(f"tool_call_id={tool_call_id}")
+        if tool_calls_count:
+            extra.append(f"tool_calls={tool_calls_count}")
+        suffix = f" ({', '.join(extra)})" if extra else ""
+        parts.append(f"{role}:{content_preview}{suffix}")
+    return _truncate(" | ".join(parts), max_len)
 
 
 def _require_env(name: str) -> str:
@@ -50,6 +197,30 @@ def _load_planner_config() -> OpenAICompatibleChatConfig:
     )
 
 
+def _load_task_agent_config() -> OpenAICompatibleChatConfig:
+    return OpenAICompatibleChatConfig(
+        base_url=_require_env("TASK_AGENT_BASE_URL"),
+        api_key=_require_env("TASK_AGENT_API_KEY"),
+        model=_require_env("TASK_AGENT_MODEL"),
+    )
+
+
+def _task_tools() -> List[Any]:
+    return [
+        text_search_tool,
+        path_glob_tool,
+        tree_summary_tool,
+        read_file_range_tool,
+        symbol_index_tool,
+        find_references_tool,
+        file_metadata_tool,
+        language_stats_tool,
+        code_vector_search_tool,
+        think_tool,
+        RetrievalComplete,
+    ]
+
+
 async def planner_node(state: RetrievalAgentState) -> Command:
     """Planner/Supervisor node.
 
@@ -57,6 +228,7 @@ async def planner_node(state: RetrievalAgentState) -> Command:
     - Analyze the user query.
     - Produce a high-level plan and sub-task list.
     """
+    logger.info("++++++++++ planner node start ++++++++++")
     root_dir = str(state.get("root_dir", "") or "").strip()
     if not root_dir:
         raise ValueError("Missing required field: root_dir")
@@ -107,8 +279,61 @@ async def task_agent_node(state: SubtaskState) -> Command:
     - Append an AIMessage to state['messages'].
     - Set state['last_step_had_tool_calls'] based on the AIMessage tool_calls.
     """
-    raise NotImplementedError
+    root_dir = str(state.get("root_dir", "") or "").strip()
+    if not root_dir:
+        raise ValueError("Missing required field: root_dir")
 
+    sub_task = state.get("sub_task") or {}
+    name = str(sub_task.get("name", "") or "").strip()
+    instruction = str(sub_task.get("instruction", "") or "").strip()
+    if not name and not instruction:
+        return Command(update={"notes": ["empty_subtask"], "last_step_had_tool_calls": False})
+
+    prefix = _log_prefix("task_agent", dict(state))
+    logger.info("++++++++++ task_agent node start ++++++++++ %s", prefix)
+
+    cfg = _load_task_agent_config()
+    client = OpenAICompatibleChatLLMService(cfg)
+    bound = bind_tools(client, _task_tools())
+
+    messages = list(state.get("messages") or [])
+    new_messages: List[Dict[str, Any]] = []
+    if not messages:
+        task_text = f"Subtask: {name}\nInstruction: {instruction}\nRoot directory: {root_dir}"
+        user_message = {"role": "user", "content": task_text}
+        messages.append(user_message)
+        new_messages.append(user_message)
+
+    logger.info("%s llm_messages %s", prefix, _messages_summary(messages))
+    logger.debug("%s llm_messages_full %s", prefix, messages)
+
+    req = LLMRequest(
+        messages=messages,
+        system_prompt=task_agent_system_prompt,
+        temperature=0.0,
+        max_tokens=8000,
+    )
+    resp = await bound.complete(req)
+    tool_calls = resp.get_tool_calls()
+
+    logger.info("%s llm_done tool_calls=%d", prefix, len(tool_calls))
+    if tool_calls:
+        logger.info("%s tool_calls %s", prefix, _tool_calls_brief(tool_calls))
+    logger.debug("%s llm_text=%r", prefix, _truncate(resp.raw_text or resp.content_text or "", 200))
+    assistant_message = {
+        "role": "assistant",
+        "content": (resp.raw_text or resp.content_text or ""),
+        "tool_calls": tool_calls,
+    }
+
+    return Command(
+        update={
+            "messages": [*new_messages, assistant_message],
+            "last_step_had_tool_calls": bool(tool_calls),
+        }
+    )
+
+task_tool_reg = ToolRegistry(_task_tools())
 
 async def task_tools_node(state: SubtaskState) -> Command:
     """Tool execution node for the subtask agent.
@@ -124,7 +349,113 @@ async def task_tools_node(state: SubtaskState) -> Command:
             - loops back to `task_agent` (continue tool-calling), or
       - proceeds to `synthesize` (no tool calls / hit tool loop limit).
     """
-    raise NotImplementedError
+    prefix = _log_prefix("task_tools", dict(state))
+    logger.info("++++++++++ task_tools node start ++++++++++ %s", prefix)
+
+    messages = list(state.get("messages") or [])
+    if not messages:
+        return Command(update={"last_step_had_tool_calls": False})
+
+    last_msg = messages[-1]
+    tool_calls_raw = last_msg.get("tool_calls") if isinstance(last_msg, dict) else None
+    if not tool_calls_raw:
+        return Command(update={"last_step_had_tool_calls": False})
+
+    tool_calls = extract_tool_calls(
+        LLMResponse(raw_text="", tool_calls=list(tool_calls_raw) if isinstance(tool_calls_raw, list) else [])
+    )
+    if not tool_calls:
+        return Command(update={"last_step_had_tool_calls": False})
+
+    logger.info("%s start tool_calls=%d", prefix, len(tool_calls))
+
+    completion_tool_names = {"RetrievalComplete", "ResearchComplete", "ResearchCompleted"}
+    has_completion = any(tc.get("name") in completion_tool_names for tc in tool_calls)
+
+    observations: List[Any] = []
+    executed_calls: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    if has_completion:
+        logger.info("%s completion_requested", prefix)
+        for idx, tc in enumerate(tool_calls, start=1):
+            if tc.get("name") in completion_tool_names:
+                obs = "Retrieval marked complete"
+                observations.append(obs)
+                executed_calls.append(tc)
+                notes.append(
+                    _tool_call_note(
+                        str(tc.get("name") or ""),
+                        tc.get("args") or {},
+                        obs,
+                        {"tool_iter": int(state.get("tool_call_iterations", 0)), "call_index": idx},
+                    )
+                )
+        notes.append("retrieval_complete_requested")
+        tool_messages = tool_messages_from_observations(
+            tool_calls=executed_calls,
+            observations=observations,
+        )
+        return Command(
+            update={
+                "messages": tool_messages,
+                "notes": notes,
+                "last_step_had_tool_calls": False,
+                "tool_call_iterations": int(state.get("tool_call_iterations", 0)) + 1,
+            }
+        )
+
+    if any(str(tc.get("name") or "") == "think_tool" for tc in tool_calls) and len(tool_calls) > 1:
+        notes.append("think_tool_parallel_violation")
+        logger.warning("%s think_tool_parallel_violation", prefix)
+
+    tool_iter = int(state.get("tool_call_iterations", 0))
+    for idx, tc in enumerate(tool_calls, start=1):
+        name = str(tc.get("name") or "").strip()
+        args = tc.get("args") or {}
+        if name == "think_tool" and "reflection" not in args and "tool_input" in args:
+            args = dict(args)
+            args["reflection"] = args.get("tool_input")
+        logger.info("%s tool_execute name=%s args=%s", prefix, name, _tool_args_summary(args))
+        spec = task_tool_reg.get(name)
+        if spec is None:
+            logger.warning("%s tool_unknown name=%s", prefix, name)
+            obs = {"error": f"unknown_tool:{name}"}
+            observations.append(obs)
+            executed_calls.append(tc)
+            notes.append(_tool_call_note(name, args, obs, {"tool_iter": tool_iter, "call_index": idx}))
+            continue
+
+        t0 = time.perf_counter()
+        obs = await execute_tool_safely(spec, args)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+
+        summary = _result_summary(obs)
+        logger.info("%s tool_result name=%s dt_ms=%.1f result=%s", prefix, name, dt_ms, summary)
+        logger.info("%s tool_result_value name=%s value=%s", prefix, name, _truncate(str(obs), 500))
+        if isinstance(obs, dict) and obs.get("error"):
+            logger.warning("%s tool_result_error name=%s error=%r", prefix, name, _truncate(str(obs.get("error")), 200))
+
+        observations.append(obs)
+        executed_calls.append(tc)
+        notes.append(_tool_call_note(name, args, obs, {"tool_iter": tool_iter, "call_index": idx}))
+
+        if name == "think_tool":
+            notes.append("think_tool_used")
+
+    tool_messages = tool_messages_from_observations(
+        tool_calls=executed_calls,
+        observations=observations,
+    )
+
+    return Command(
+        update={
+            "messages": tool_messages,
+            "notes": notes,
+            "last_step_had_tool_calls": True,
+            "tool_call_iterations": int(state.get("tool_call_iterations", 0)) + 1,
+        }
+    )
 
 
 async def synthesize_node(state: SubtaskState) -> Command:
@@ -134,7 +465,65 @@ async def synthesize_node(state: SubtaskState) -> Command:
     - Deduplicate and merge evidence.
     - Produce a subtask-level result with citations.
     """
-    raise NotImplementedError
+    prefix = _log_prefix("synthesize", dict(state))
+    logger.info("++++++++++ synthesize node start ++++++++++ %s", prefix)
+
+    sub_task = state.get("sub_task") or {}
+    name = str(sub_task.get("name", "") or "").strip()
+    instruction = str(sub_task.get("instruction", "") or "").strip()
+    notes = list(state.get("notes") or [])
+
+    tool_blocks: List[str] = []
+    extra_notes: List[str] = []
+    for note in notes:
+        if not isinstance(note, str):
+            extra_notes.append(str(note))
+            continue
+        try:
+            payload = json.loads(note)
+            if isinstance(payload, dict):
+                pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+                tool_blocks.append(pretty)
+            else:
+                extra_notes.append(note)
+        except Exception:
+            extra_notes.append(note)
+
+    lines: List[str] = [
+        "# Subtask Debug Report",
+        "",
+        f"**Title**: {name or '(empty)'}",
+        f"**Instruction**: {instruction or '(empty)'}",
+        "",
+        "## Tool Calls",
+    ]
+    if tool_blocks:
+        for idx, block in enumerate(tool_blocks, start=1):
+            lines.append(f"### Call {idx}")
+            lines.append("```json")
+            lines.append(block)
+            lines.append("```")
+            lines.append("")
+    else:
+        lines.append("- (none)")
+
+    if extra_notes:
+        lines.append("## Notes")
+        for note in extra_notes:
+            lines.append(f"- {note}")
+
+    report = "\n".join(lines).rstrip()
+    logger.info("%s synthesize_report\n%s", prefix, report)
+
+    report_path = _safe_filename(name or instruction or "subtask")
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report)
+        logger.info("%s synthesize_report_written path=%s", prefix, report_path)
+    except Exception as e:
+        logger.warning("%s synthesize_report_write_failed error=%s", prefix, e)
+
+    return Command(update={"notes": [report], "last_step_had_tool_calls": False})
 
 
 async def verify_node(state: SubtaskState) -> Command:
@@ -153,7 +542,9 @@ async def verify_node(state: SubtaskState) -> Command:
         - tool_call_iterations = 0
         - last_step_had_tool_calls = False
     """
-    raise NotImplementedError
+    prefix = _log_prefix("verify", dict(state))
+    logger.info("++++++++++ verify node start ++++++++++ %s", prefix)
+    return Command(update={"needs_more": False})
 
 async def summarize_node(state: RetrievalAgentState) -> Command:
     """Summarize all subtask results.
@@ -162,6 +553,7 @@ async def summarize_node(state: RetrievalAgentState) -> Command:
     - Merge sub_results into a final answer.
     - Resolve conflicts and ensure coverage.
     """
+    logger.info("++++++++++ summarize node start ++++++++++")
     raise NotImplementedError
 
 
@@ -254,6 +646,7 @@ async def run_subtasks_node(state: RetrievalAgentState) -> Command:
         This node is reserved for a future implementation. In the current
         graph skeleton, the subtask graph is used directly as a node.
     """
+    logger.info("++++++++++ run_subtasks node start ++++++++++")
     root_dir = str(state.get("root_dir", "") or "").strip()
     if not root_dir:
         raise ValueError("Missing required field: root_dir")

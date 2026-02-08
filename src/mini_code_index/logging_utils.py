@@ -19,7 +19,7 @@ def setup_logging(*, log_level: Optional[str] = None, log_file: Optional[str] = 
         os.makedirs(file_dir, exist_ok=True)
 
     formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        fmt="%(asctime)s | %(levelname)s | pid=%(process)d tid=%(thread)d | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
