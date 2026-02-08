@@ -30,8 +30,20 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
-from mini_code_index.retrieval.prompts import planner_system_prompt, task_agent_system_prompt
-from mini_code_index.retrieval.state import RetrievalPlan, RetrievalAgentState, RetrievalComplete, SubtaskState
+from mini_code_index.retrieval.prompts import (
+    planner_system_prompt,
+    task_agent_system_prompt,
+    subtask_synthesize_system_prompt,
+    summarize_system_prompt,
+)
+from mini_code_index.retrieval.state import (
+    RetrievalPlan,
+    RetrievalAgentState,
+    RetrievalComplete,
+    FinalAnswer,
+    SubtaskResult,
+    SubtaskState,
+)
 from mini_code_index.retrieval.util.llm_factory import OpenAICompatibleChatLLMService
 from mini_code_index.retrieval.util.llm_utils import log_llm_json_result
 from mini_code_index.retrieval.util.llm_tooling import (
@@ -243,6 +255,14 @@ def _load_task_agent_config() -> OpenAICompatibleChatConfig:
     )
 
 
+def _load_synthesize_config() -> OpenAICompatibleChatConfig:
+    return OpenAICompatibleChatConfig(
+        base_url=_require_env("SYNTHESIZER_BASE_URL"),
+        api_key=_require_env("SYNTHESIZER_API_KEY"),
+        model=_require_env("SYNTHESIZER_MODEL"),
+    )
+
+
 def _task_tools() -> List[Any]:
     return [
         text_search_tool,
@@ -330,7 +350,7 @@ async def task_agent_node(state: SubtaskState) -> Command:
     prefix = _log_prefix("task_agent", dict(state))
     logger.info("++++++++++ task_agent node start ++++++++++ %s", prefix)
 
-    cfg = _load_task_agent_config()
+    cfg = _load_synthesize_config()
     client = OpenAICompatibleChatLLMService(cfg)
     bound = bind_tools(client, _task_tools())
 
@@ -596,6 +616,37 @@ async def synthesize_node(state: SubtaskState) -> Command:
     report = "\n".join(lines).rstrip()
     logger.info("%s synthesize_report\n%s", prefix, report)
 
+    cfg = _load_task_agent_config()
+    client = OpenAICompatibleChatLLMService(cfg)
+    synth_prompt = (
+        f"Subtask Title: {name or '(empty)'}\n"
+        f"Instruction: {instruction or '(empty)'}\n\n"
+        f"Debug Report:\n{report}"
+    )
+    req = LLMRequest.from_prompt(
+        prompt=synth_prompt,
+        system_prompt=subtask_synthesize_system_prompt,
+        parse_json=True,
+        temperature=0.0,
+        max_tokens=4096,
+    )
+    resp = await client.complete(req)
+
+    result_dict: Optional[Dict[str, Any]] = None
+    if resp.parse_error or not resp.json_data:
+        logger.warning(
+            "%s synthesize_parse_failed error=%s",
+            prefix,
+            resp.parse_error or "empty_json",
+        )
+    else:
+        try:
+            result_model = SubtaskResult.model_validate(resp.json_data)
+            result_dict = result_model.model_dump()
+            logger.info("%s synthesize_result %s", prefix, result_dict)
+        except Exception as e:
+            logger.warning("%s synthesize_validate_failed error=%s", prefix, e)
+
     report_path = _safe_filename(name or instruction or "subtask")
     try:
         with open(report_path, "w", encoding="utf-8") as f:
@@ -604,7 +655,13 @@ async def synthesize_node(state: SubtaskState) -> Command:
     except Exception as e:
         logger.warning("%s synthesize_report_write_failed error=%s", prefix, e)
 
-    return Command(update={"notes": [report], "last_step_had_tool_calls": False})
+    return Command(
+        update={
+            "notes": [report],
+            "result": result_dict,
+            "last_step_had_tool_calls": False,
+        }
+    )
 
 
 async def verify_node(state: SubtaskState) -> Command:
@@ -623,6 +680,7 @@ async def verify_node(state: SubtaskState) -> Command:
         - tool_call_iterations = 0
         - last_step_had_tool_calls = False
     """
+    # TODO: Do we need this node?
     prefix = _log_prefix("verify", dict(state))
     logger.info("++++++++++ verify node start ++++++++++ %s", prefix)
     return Command(update={"needs_more": False})
@@ -635,7 +693,59 @@ async def summarize_node(state: RetrievalAgentState) -> Command:
     - Resolve conflicts and ensure coverage.
     """
     logger.info("++++++++++ summarize node start ++++++++++")
-    raise NotImplementedError
+    query = str(state.get("query", "") or "").strip()
+    sub_results = list(state.get("sub_results") or [])
+
+    bundles: List[Dict[str, Any]] = []
+    for item in sub_results:
+        if not isinstance(item, dict):
+            continue
+        sub_task = item.get("sub_task") or {}
+        name = str(sub_task.get("name", "") or "").strip()
+        instruction = str(sub_task.get("instruction", "") or "").strip()
+        result = item.get("result")
+        notes = item.get("notes") or []
+        report = ""
+        if isinstance(notes, list):
+            for n in notes:
+                if isinstance(n, str) and n.strip():
+                    report = n
+                    break
+        bundles.append(
+            {
+                "name": name,
+                "instruction": instruction,
+                "result": result,
+                "report": report,
+            }
+        )
+
+    cfg = _load_synthesize_config()
+    client = OpenAICompatibleChatLLMService(cfg)
+    summary_prompt = (
+        f"User Query: {query or '(empty)'}\n\n"
+        f"Subtask Bundles:\n{json.dumps(bundles, ensure_ascii=False, indent=2, default=str)}"
+    )
+    req = LLMRequest.from_prompt(
+        prompt=summary_prompt,
+        system_prompt=summarize_system_prompt,
+        parse_json=False,
+        temperature=0.0,
+        max_tokens=32000,
+    )
+
+    parts: List[str] = []
+    async for chunk in client.stream(req):
+        if chunk.delta_text:
+            print(f"\033[31m{chunk.delta_text}\033[0m", end="", flush=True)
+            parts.append(chunk.delta_text)
+    final_text = "".join(parts).strip()
+    if final_text:
+        logger.info("[summarize] final_text %s \n\n", _truncate(final_text, 1200))
+    else:
+        logger.warning("[summarize] empty_text")
+
+    return Command(update={"answer": final_text})
 
 
 def _route_after_verify(state: SubtaskState) -> str:

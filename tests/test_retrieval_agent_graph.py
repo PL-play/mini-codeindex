@@ -26,7 +26,7 @@ class TestRetrievalAgentGraph(unittest.TestCase):
                 graph.ainvoke(
                     {"query": query, "root_dir": root_dir, "max_iterations": 2, "max_tool_call_iterations": 10})
             )
-            print("graph run result:", result)
+            # print("graph run result:", result)
         except Exception as exc:
             print("graph run failed (expected if subgraph nodes not implemented):", exc)
 
