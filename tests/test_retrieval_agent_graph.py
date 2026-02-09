@@ -14,13 +14,14 @@ class TestRetrievalAgentGraph(unittest.TestCase):
 
     def test_batch_questions_write_md(self) -> None:
         graph = build_retrieval_agent_graph()
-        root_dir = str(Path(__file__).resolve().parent.parent / "test_code_index_project")
+        root_dir = str(Path(__file__).resolve().parent / "test_code_index_project")
         questions = [
-            "这个项目的主要目的是什么？它的核心功能有哪些？",
-            "项目里有哪些主要模块（Java 和 Python 各自有哪些关键文件/目录）？",
-            "Java 侧的用户管理功能涉及哪些核心类，它们之间是什么关系？",
-            "Python 侧的数据处理流程是什么，入口脚本和关键依赖文件有哪些？",
-            "项目中有哪些设计模式示例？各自对应的类或文件在哪里？",
+            # "这个项目的主要目的是什么？它的核心功能有哪些？",
+            # "项目里有哪些主要模块（Java 和 Python 各自有哪些关键文件/目录）？",
+            # "Java 侧的用户管理功能涉及哪些核心类，它们之间是什么关系？",
+            # "Python 侧的数据处理流程是什么，入口脚本和关键依赖文件有哪些？",
+            # "项目中有哪些设计模式示例？各自对应的类或文件在哪里？",
+            "报表生成完整的数据流是什么，给出详细的函数调用链?"
         ]
 
         out_lines = ["# Retrieval Agent Batch Results", ""]
