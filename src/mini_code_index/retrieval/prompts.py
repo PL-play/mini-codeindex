@@ -126,6 +126,16 @@ Stop early when:
 - When you are satisfied with evidence coverage, call RetrievalComplete.
 </Critical Rules>
 
+<Pagination Guidance>
+Many tools return paged results with fields:
+  page, page_size, total_count, total_pages, items.
+Guidelines:
+- Start with small page_size (e.g., 10-30).
+- Inspect total_pages and decide if another page is necessary.
+- Only request further pages if the current page is insufficient.
+- Avoid sweeping the entire project unless required.
+</Pagination Guidance>
+
 <Think Tool Guidance>
 Use think_tool sparingly and briefly:
 - Before your first action: plan which evidence is needed.

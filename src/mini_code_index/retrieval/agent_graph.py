@@ -378,7 +378,7 @@ async def task_agent_node(state: SubtaskState) -> Command:
         messages=messages,
         system_prompt=task_agent_system_prompt,
         temperature=0.0,
-        max_tokens=8000,
+        max_tokens=0,
     )
     try:
         resp = await bound.complete(req)
@@ -457,19 +457,22 @@ async def task_tools_node(state: SubtaskState) -> Command:
 
     if has_completion:
         logger.info("%s completion_requested", prefix)
-        for idx, tc in enumerate(tool_calls, start=1):
-            if tc.get("name") in completion_tool_names:
-                obs = "Retrieval marked complete"
-                observations.append(obs)
-                executed_calls.append(tc)
-                notes.append(
-                    _tool_call_note(
-                        str(tc.get("name") or ""),
-                        tc.get("args") or {},
-                        obs,
-                        {"tool_iter": int(state.get("tool_call_iterations", 0)), "call_index": idx},
-                    )
+        completion_calls = [tc for tc in tool_calls if tc.get("name") in completion_tool_names]
+        if len(completion_calls) > 1:
+            logger.warning("%s multiple_completion_calls count=%d", prefix, len(completion_calls))
+        if completion_calls:
+            tc = completion_calls[0]
+            obs = "Retrieval marked complete"
+            observations.append(obs)
+            executed_calls.append(tc)
+            notes.append(
+                _tool_call_note(
+                    str(tc.get("name") or ""),
+                    tc.get("args") or {},
+                    obs,
+                    {"tool_iter": int(state.get("tool_call_iterations", 0)), "call_index": 1},
                 )
+            )
         tool_messages = tool_messages_from_observations(
             tool_calls=executed_calls,
             observations=observations,
@@ -660,7 +663,7 @@ async def synthesize_node(state: SubtaskState) -> Command:
             system_prompt=subtask_synthesize_system_prompt,
             parse_json=True,
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=0,
         )
         resp = await client.complete(req)
     finally:
@@ -766,7 +769,7 @@ async def summarize_node(state: RetrievalAgentState) -> Command:
             system_prompt=summarize_system_prompt,
             parse_json=False,
             temperature=0.0,
-            max_tokens=32000,
+            max_tokens=0,
         )
 
         parts: List[str] = []

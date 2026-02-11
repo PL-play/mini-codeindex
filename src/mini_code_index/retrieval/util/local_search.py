@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import fnmatch
 import json
+import math
 import os
 import re
 from datetime import datetime
@@ -80,7 +81,7 @@ def text_search(
     is_regex: bool = False,
     include_glob: Optional[str] = None,
     exclude_glob: Optional[str] = None,
-    max_results: int = 200,
+    max_results: int = 20,
     context_lines: int = 2,
 ) -> List[TextSearchResult]:
     pattern = query if is_regex else re.escape(query)
@@ -300,7 +301,23 @@ def _to_json_str(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-# TODO: Need to update this tool. Too many context in result. Should we provide `page` and `page_size` parameters?
+def _paged_response(items: List[object], *, page: int, page_size: int) -> Dict[str, object]:
+    safe_page = max(1, int(page))
+    safe_page_size = max(1, int(page_size))
+    total_count = len(items)
+    total_pages = max(1, math.ceil(total_count / safe_page_size)) if total_count else 1
+    start = (safe_page - 1) * safe_page_size
+    end = start + safe_page_size
+    page_items = items[start:end]
+    return {
+        "page": safe_page,
+        "page_size": safe_page_size,
+        "total_count": total_count,
+        "total_pages": total_pages,
+        "items": page_items,
+    }
+
+
 async def text_search_tool(
     root_dir: str,
     query: str,
@@ -308,8 +325,10 @@ async def text_search_tool(
     is_regex: bool = False,
     include_glob: Optional[str] = None,
     exclude_glob: Optional[str] = None,
-    max_results: int = 200,
+    max_results: int = 30,
     context_lines: int = 2,
+    page: int = 1,
+    page_size: int = 50,
 ) -> str:
     """LLM Tool: Search text within a directory and return JSON as a string.
 
@@ -323,11 +342,18 @@ async def text_search_tool(
         context_lines: Number of context lines before/after the matched line.
 
     Returns:
-        JSON string encoding a list of results. Each item contains:
-            path, line, col, snippet, context_before, context_after.
+        JSON string encoding a page object:
+            {
+              "page": int,
+              "page_size": int,
+              "total_count": int,
+              "total_pages": int,
+              "items": [ ... ]
+            }
+        Each item contains: path, line, col, snippet, context_before, context_after.
 
     Usage:
-        await text_search_tool("/repo", "embedding", include_glob="**/*.py")
+        await text_search_tool("/repo", "embedding", include_glob="**/*.py", page=1, page_size=50)
     """
     results = text_search(
         root_dir,
@@ -338,10 +364,17 @@ async def text_search_tool(
         max_results=max_results,
         context_lines=context_lines,
     )
-    return _to_json_str(results)
+    return _to_json_str(_paged_response(results, page=page, page_size=page_size))
 
 
-async def path_glob_tool(root_dir: str, pattern: str, *, max_results: int = 500) -> str:
+async def path_glob_tool(
+    root_dir: str,
+    pattern: str,
+    *,
+    max_results: int = 500,
+    page: int = 1,
+    page_size: int = 200,
+) -> str:
     """LLM Tool: Match file paths by glob pattern and return JSON as a string.
 
     Args:
@@ -350,13 +383,13 @@ async def path_glob_tool(root_dir: str, pattern: str, *, max_results: int = 500)
         max_results: Maximum number of paths to return.
 
     Returns:
-        JSON string encoding a list of objects with: path.
+        JSON string encoding a page object with items: [{"path": ...}].
 
     Usage:
-        await path_glob_tool("/repo", "src/**/*.ts")
+        await path_glob_tool("/repo", "src/**/*.ts", page=1, page_size=200)
     """
     results = path_glob(root_dir, pattern, max_results=max_results)
-    return _to_json_str(results)
+    return _to_json_str(_paged_response(results, page=page, page_size=page_size))
 
 
 async def tree_summary_tool(
@@ -413,6 +446,8 @@ async def symbol_index_tool(
     *,
     languages: Optional[List[str]] = None,
     include_glob: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 200,
 ) -> str:
     """LLM Tool: Extract symbol index and return JSON as a string.
 
@@ -422,14 +457,14 @@ async def symbol_index_tool(
         include_glob: Optional glob to include files.
 
     Returns:
-        JSON string encoding a list of symbols. Each item contains:
+        JSON string encoding a page object with items:
             symbol, kind, path, line.
 
     Usage:
-        await symbol_index_tool("/repo", languages=["python", "java"])
+        await symbol_index_tool("/repo", languages=["python", "java"], page=1, page_size=200)
     """
     results = symbol_index(root_dir, languages=languages, include_glob=include_glob)
-    return _to_json_str(results)
+    return _to_json_str(_paged_response(results, page=page, page_size=page_size))
 
 
 async def find_references_tool(
@@ -439,6 +474,8 @@ async def find_references_tool(
     is_regex: bool = False,
     include_glob: Optional[str] = None,
     max_results: int = 200,
+    page: int = 1,
+    page_size: int = 100,
 ) -> str:
     """LLM Tool: Find textual references to a symbol and return JSON as a string.
 
@@ -450,11 +487,11 @@ async def find_references_tool(
         max_results: Maximum number of matches to return.
 
     Returns:
-        JSON string encoding a list of references. Each item contains:
+        JSON string encoding a page object with items:
             path, line, snippet.
 
     Usage:
-        await find_references_tool("/repo", "VectorStore", include_glob="**/*.py")
+        await find_references_tool("/repo", "VectorStore", include_glob="**/*.py", page=1, page_size=100)
     """
     results = find_references(
         root_dir,
@@ -463,7 +500,7 @@ async def find_references_tool(
         include_glob=include_glob,
         max_results=max_results,
     )
-    return _to_json_str(results)
+    return _to_json_str(_paged_response(results, page=page, page_size=page_size))
 
 
 async def file_metadata_tool(path: str) -> str:
@@ -482,7 +519,13 @@ async def file_metadata_tool(path: str) -> str:
     return _to_json_str(results)
 
 
-async def language_stats_tool(root_dir: str, *, include_glob: Optional[str] = None) -> str:
+async def language_stats_tool(
+    root_dir: str,
+    *,
+    include_glob: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 200,
+) -> str:
     """LLM Tool: Collect language/extension statistics and return JSON as a string.
 
     Args:
@@ -490,10 +533,10 @@ async def language_stats_tool(root_dir: str, *, include_glob: Optional[str] = No
         include_glob: Optional glob to include files.
 
     Returns:
-        JSON string encoding a list of items: ext, files, lines.
+        JSON string encoding a page object with items: ext, files, lines.
 
     Usage:
-        await language_stats_tool("/repo", include_glob="**/*")
+        await language_stats_tool("/repo", include_glob="**/*", page=1, page_size=200)
     """
     results = language_stats(root_dir, include_glob=include_glob)
-    return _to_json_str(results)
+    return _to_json_str(_paged_response(results, page=page, page_size=page_size))

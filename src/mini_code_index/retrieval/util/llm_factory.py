@@ -188,7 +188,12 @@ class OpenAICompatibleChatLLMService(LLMService):
         if request.temperature is not None:
             out["temperature"] = float(request.temperature)
         if request.max_tokens is not None:
-            out["max_tokens"] = int(request.max_tokens)
+            try:
+                max_tokens = int(request.max_tokens)
+            except Exception:
+                max_tokens = None
+            if max_tokens is not None and max_tokens > 0:
+                out["max_tokens"] = max_tokens
         if request.tools is not None:
             out["tools"] = request.tools
         if request.tool_choice is not None:
