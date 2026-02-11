@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+from pathlib import Path
 from typing import Sequence, Mapping, Any, Optional
 from urllib.parse import urlparse
 from urllib.parse import urlparse
@@ -352,7 +353,7 @@ def test_full_pipeline_with_real_services() -> None:
     except Exception as e:
         pytest.skip(f"Embedder config missing: {e}")
 
-    test_project_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
+    test_project_dir = str(Path(__file__).resolve().parent / "test_code_index_project")
     cfg = IndexConfig(
         root_dir=str(test_project_dir),
         dry_run=False,

@@ -300,6 +300,7 @@ def _to_json_str(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+# TODO: Need to update this tool. Too many context in result. Should we provide `page` and `page_size` parameters?
 async def text_search_tool(
     root_dir: str,
     query: str,
