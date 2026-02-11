@@ -325,7 +325,6 @@ async def text_search_tool(
     is_regex: bool = False,
     include_glob: Optional[str] = None,
     exclude_glob: Optional[str] = None,
-    max_results: int = 30,
     context_lines: int = 2,
     page: int = 1,
     page_size: int = 50,
@@ -338,8 +337,9 @@ async def text_search_tool(
         is_regex: If True, treat query as regex; otherwise escape as literal text.
         include_glob: Optional glob to include files (relative to root_dir).
         exclude_glob: Optional glob to exclude files (relative to root_dir).
-        max_results: Maximum number of matches to return.
         context_lines: Number of context lines before/after the matched line.
+        page: 1-based page index.
+        page_size: Number of records per page.
 
     Returns:
         JSON string encoding a page object:
@@ -355,23 +355,26 @@ async def text_search_tool(
     Usage:
         await text_search_tool("/repo", "embedding", include_glob="**/*.py", page=1, page_size=50)
     """
+    safe_page = max(1, int(page))
+    safe_page_size = max(1, int(page_size))
+    fetch_limit = max(30, safe_page * safe_page_size)
+
     results = text_search(
         root_dir,
         query,
         is_regex=is_regex,
         include_glob=include_glob,
         exclude_glob=exclude_glob,
-        max_results=max_results,
+        max_results=fetch_limit,
         context_lines=context_lines,
     )
-    return _to_json_str(_paged_response(results, page=page, page_size=page_size))
+    return _to_json_str(_paged_response(results, page=safe_page, page_size=safe_page_size))
 
 
 async def path_glob_tool(
     root_dir: str,
     pattern: str,
     *,
-    max_results: int = 500,
     page: int = 1,
     page_size: int = 200,
 ) -> str:
@@ -380,7 +383,8 @@ async def path_glob_tool(
     Args:
         root_dir: Root directory to scan.
         pattern: Glob pattern (relative to root_dir), e.g. "**/*.py".
-        max_results: Maximum number of paths to return.
+        page: 1-based page index.
+        page_size: Number of records per page.
 
     Returns:
         JSON string encoding a page object with items: [{"path": ...}].
@@ -388,8 +392,12 @@ async def path_glob_tool(
     Usage:
         await path_glob_tool("/repo", "src/**/*.ts", page=1, page_size=200)
     """
-    results = path_glob(root_dir, pattern, max_results=max_results)
-    return _to_json_str(_paged_response(results, page=page, page_size=page_size))
+    safe_page = max(1, int(page))
+    safe_page_size = max(1, int(page_size))
+    fetch_limit = max(500, safe_page * safe_page_size)
+
+    results = path_glob(root_dir, pattern, max_results=fetch_limit)
+    return _to_json_str(_paged_response(results, page=safe_page, page_size=safe_page_size))
 
 
 async def tree_summary_tool(
@@ -473,7 +481,6 @@ async def find_references_tool(
     *,
     is_regex: bool = False,
     include_glob: Optional[str] = None,
-    max_results: int = 200,
     page: int = 1,
     page_size: int = 100,
 ) -> str:
@@ -484,7 +491,8 @@ async def find_references_tool(
         symbol: Symbol name or regex pattern.
         is_regex: If True, interpret symbol as regex; otherwise use word-boundary match.
         include_glob: Optional glob to include files.
-        max_results: Maximum number of matches to return.
+        page: 1-based page index.
+        page_size: Number of records per page.
 
     Returns:
         JSON string encoding a page object with items:
@@ -493,14 +501,18 @@ async def find_references_tool(
     Usage:
         await find_references_tool("/repo", "VectorStore", include_glob="**/*.py", page=1, page_size=100)
     """
+    safe_page = max(1, int(page))
+    safe_page_size = max(1, int(page_size))
+    fetch_limit = max(200, safe_page * safe_page_size)
+
     results = find_references(
         root_dir,
         symbol,
         is_regex=is_regex,
         include_glob=include_glob,
-        max_results=max_results,
+        max_results=fetch_limit,
     )
-    return _to_json_str(_paged_response(results, page=page, page_size=page_size))
+    return _to_json_str(_paged_response(results, page=safe_page, page_size=safe_page_size))
 
 
 async def file_metadata_tool(path: str) -> str:

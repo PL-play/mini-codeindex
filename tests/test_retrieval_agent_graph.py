@@ -34,9 +34,8 @@ class TestRetrievalAgentGraph(unittest.TestCase):
                             "query": query,
                             "root_dir": root_dir,
                             "max_iterations": 2,
-                            "max_tool_call_iterations": 8,
+                            "max_tool_call_iterations": 5,
                         },
-                        {"recursion_limit": 80},
                     )
                     answer = ""
                     if isinstance(result, dict):
