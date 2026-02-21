@@ -134,8 +134,7 @@ def test_index_directory_smoke(tmp_path) -> None:
     """
 
     # --- prepare a tiny directory ---
-    root_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
-
+    root_dir = str(Path(__file__).resolve().parent / "test_code_index_project")
     # --- configs you can tweak ---
     cfg = IndexConfig(
         root_dir=str(root_dir),
@@ -184,7 +183,7 @@ def test_chunk_directory_with_complex_code(tmp_path) -> None:
     """
 
     # Use the complex test project directory we created
-    test_project_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
+    test_project_dir = str(Path(__file__).resolve().parent / "test_code_index_project")
     # Configure chunking
     chunk_cfg = ChunkConfig(
         chunk_size=1200,
@@ -269,7 +268,7 @@ def test_chunk_directory_with_complex_code(tmp_path) -> None:
 def test_index_directory_no_error() -> None:
     """Run index_directory on the complex test project and ensure no error."""
 
-    test_project_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
+    test_project_dir = str(Path(__file__).resolve().parent / "test_code_index_project")
     cfg = IndexConfig(
         root_dir=str(test_project_dir),
         dry_run=False,
@@ -303,7 +302,7 @@ def test_index_directory_no_error() -> None:
 @pytest.mark.integration
 def test_index_directory_capture_chunks_to_file(tmp_path) -> None:
     """Index a project and dump collected chunks into a text file."""
-    test_project_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
+    test_project_dir = str(Path(__file__).resolve().parent / "test_code_index_project")
     cfg = IndexConfig(
         root_dir=str(test_project_dir),
         dry_run=False,
@@ -409,8 +408,8 @@ def test_chromadb_query_smoke() -> None:
     parsed = urlparse(chroma_host)
     client = chromadb.HttpClient(host=parsed.hostname, port=parsed.port)
 
-    root_dir = "/home/ran/Documents/work/VectorCode/mini_code_index/test_code_index_project"
-    collection_name = _collection_name_for_root(root_dir)
+    test_project_dir = str(Path(__file__).resolve().parent / "test_code_index_project")
+    collection_name = _collection_name_for_root(test_project_dir)
     try:
         collection = client.get_collection(collection_name)
     except Exception as e:

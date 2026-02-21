@@ -1,0 +1,13 @@
+# Generated from pyproject.toml
+pygments>=2.17
+charset-normalizer>=3.4
+tree-sitter>=0.22
+tree-sitter-language-pack>=0.6
+aiohttp>=3.9
+langgraph
+openai
+
+
+pytest>=8.0
+python-dotenv>=1.0
+chromadb<=0.6.3
