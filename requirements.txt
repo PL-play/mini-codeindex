@@ -10,4 +10,4 @@ openai
 
 pytest>=8.0
 python-dotenv>=1.0
-chromadb<=0.6.3
+chromadb==1.5.0

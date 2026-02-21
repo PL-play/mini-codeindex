@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Protocol, Sequence
@@ -172,7 +173,15 @@ class OpenAICompatibleEmbedder:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self.timeout_s)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            
+            # Create SSL context that doesn't verify certificates
+            # This is needed when corporate proxies or firewalls intercept SSL
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
 
     async def close(self) -> None:

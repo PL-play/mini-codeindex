@@ -227,6 +227,46 @@ def schema_from_callable(fn: Any) -> Dict[str, Any]:
     return out
 
 
+def _schema_from_langchain_like_tool(obj: Any) -> Dict[str, Any]:
+    """
+    Best-effort schema extraction for LangChain tool objects
+    (e.g., StructuredTool / BaseTool instances).
+    """
+    # Preferred: explicit args schema object.
+    args_schema = getattr(obj, "args_schema", None)
+    if args_schema is not None:
+        try:
+            if hasattr(args_schema, "model_json_schema"):
+                schema = args_schema.model_json_schema()
+            elif hasattr(args_schema, "schema"):
+                schema = args_schema.schema()
+            else:
+                schema = None
+            if isinstance(schema, dict):
+                return schema
+        except Exception:
+            pass
+
+    # Fallback: tool-provided input schema object.
+    get_input_schema = getattr(obj, "get_input_schema", None)
+    if callable(get_input_schema):
+        try:
+            input_schema = get_input_schema()
+            if hasattr(input_schema, "model_json_schema"):
+                schema = input_schema.model_json_schema()
+            elif hasattr(input_schema, "schema"):
+                schema = input_schema.schema()
+            else:
+                schema = None
+            if isinstance(schema, dict):
+                return schema
+        except Exception:
+            pass
+
+    # Conservative fallback for schema-less tools.
+    return {"type": "object", "properties": {}}
+
+
 def tool_spec_from(
     obj: Any,
     *,
@@ -304,6 +344,35 @@ def tool_spec_from(
             parameters=params,
             fn=fn or _wrapped,
             raw=target,
+        )
+
+    # LangChain-like tool objects (e.g., StructuredTool / BaseTool instances)
+    # are not always directly callable, but expose name/description + invoke APIs.
+    has_tool_identity = hasattr(obj, "name") and hasattr(obj, "description")
+    has_tool_executor = callable(getattr(obj, "ainvoke", None)) or callable(getattr(obj, "invoke", None))
+    if has_tool_identity and has_tool_executor:
+        spec_name = str(name or getattr(obj, "name", obj.__class__.__name__))
+        doc = (inspect.getdoc(obj) or "").strip()
+        desc = (description or str(getattr(obj, "description", "") or "").strip()).strip()
+        merged_desc = "\n\n".join([s for s in [desc, doc] if s])
+        params = parameters or _schema_from_langchain_like_tool(obj)
+
+        async def _invoke_langchain_tool(args: Dict[str, Any]) -> Any:
+            payload = args or {}
+            ainvoke = getattr(obj, "ainvoke", None)
+            if callable(ainvoke):
+                return await ainvoke(payload)
+            invoke = getattr(obj, "invoke", None)
+            if callable(invoke):
+                return invoke(payload)
+            raise TypeError(f"Tool object is not invokable: {type(obj)}")
+
+        return ToolSpec(
+            name=spec_name,
+            description=merged_desc or "",
+            parameters=params,
+            fn=fn or _invoke_langchain_tool,
+            raw=obj,
         )
 
     raise TypeError(f"Unsupported tool spec type: {type(obj)}")

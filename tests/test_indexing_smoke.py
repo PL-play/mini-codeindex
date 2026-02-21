@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import urllib.request
 from pathlib import Path
 from typing import Sequence, Mapping, Any, Optional
 from urllib.parse import urlparse
@@ -16,6 +17,49 @@ from mini_code_index.indexing import IndexConfig, index_directory, iter_candidat
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _major_minor(version: str) -> tuple[int, int]:
+    parts = (version or "").strip().split(".")
+    nums: list[int] = []
+    for item in parts[:2]:
+        digits = "".join(ch for ch in item if ch.isdigit())
+        nums.append(int(digits) if digits else 0)
+    while len(nums) < 2:
+        nums.append(0)
+    return nums[0], nums[1]
+
+
+def _chroma_server_version(base_url: str) -> str:
+    url = f"{base_url.rstrip('/')}/api/v2/version"
+    with urllib.request.urlopen(url, timeout=2.0) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore").strip()
+    return raw.strip('"')
+
+
+def _ensure_chroma_version_compatible_or_skip(base_url: str) -> None:
+    try:
+        import chromadb  # type: ignore
+        client_version = str(getattr(chromadb, "__version__", "") or "")
+    except Exception as e:
+        pytest.skip(f"chromadb client not available: {e}")
+
+    try:
+        server_version = _chroma_server_version(base_url)
+    except Exception as e:
+        pytest.skip(f"Cannot query Chroma server version: {e}")
+
+    client_mm = _major_minor(client_version)
+    server_mm = _major_minor(server_version)
+    # Chroma server /api/v2/version reflects the server/API line (often 1.0.0),
+    # while python client can be newer in the same major line (e.g. 1.5.0).
+    # For compatibility guard, major version match is sufficient here.
+    if client_mm[0] != server_mm[0]:
+        pytest.skip(
+            "Chroma client/server version mismatch: "
+            f"client={client_version}, server={server_version}. "
+            "Use compatible major versions (for this repo, recommend both in 1.x)."
+        )
 
 
 def _load_dotenv(path: str) -> None:
@@ -346,6 +390,8 @@ def test_full_pipeline_with_real_services() -> None:
     chroma_host = os.environ.get("CHROMADB_HOST")
     if not chroma_host:
         pytest.skip("CHROMADB_HOST not set")
+
+    _ensure_chroma_version_compatible_or_skip(chroma_host)
 
     try:
         embedder = OpenAICompatibleEmbedder.from_env()

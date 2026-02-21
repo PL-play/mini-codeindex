@@ -92,7 +92,7 @@ class ChromaStore(VectorStore):
             from chromadb.config import Settings  # type: ignore
         except Exception as e:  # pragma: nocover
             raise VectorStoreError(
-                "chromadb is not installed. Install it with `pip install chromadb<=0.6.3` "
+                "chromadb is not installed. Install it with `pip install chromadb==1.5.0` "
                 "(or add it to your environment extras)."
             ) from e
 
@@ -100,7 +100,19 @@ class ChromaStore(VectorStore):
         host = parsed.hostname or "127.0.0.1"
         port = int(parsed.port or 8000)
         settings = Settings(anonymized_telemetry=False)
-        self._client = chromadb.HttpClient(host=host, port=port, settings=settings)
+        
+        # Bypass proxy for localhost/127.0.0.1 connections
+        # This prevents issues when system proxy is configured
+        import os
+        old_no_proxy = os.environ.get("NO_PROXY")
+        try:
+            os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+            self._client = chromadb.HttpClient(host=host, port=port, settings=settings)
+        finally:
+            if old_no_proxy is not None:
+                os.environ["NO_PROXY"] = old_no_proxy
+            elif "NO_PROXY" in os.environ:
+                del os.environ["NO_PROXY"]
         return self._client
 
     def _ensure_collection(self) -> Any:
