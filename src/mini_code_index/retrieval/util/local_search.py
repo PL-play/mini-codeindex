@@ -8,7 +8,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, TypedDict
+from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 
 class TextSearchResult(TypedDict):
@@ -49,6 +49,37 @@ class LanguageStatsResult(TypedDict):
     lines: int
 
 
+DEFAULT_TREE_EXCLUDE_GLOBS = [
+    "**/.git/**",
+    "**/.venv/**",
+    "**/node_modules/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "**/.tox/**",
+    "**/.idea/**",
+    "**/.vscode/**",
+    "**/dist/**",
+    "**/build/**",
+]
+
+DEFAULT_TREE_EXCLUDE_DIR_NAMES: Set[str] = {
+    ".git",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".idea",
+    ".vscode",
+    "dist",
+    "build",
+}
+
+
 def _iter_files(
     root_dir: str,
     *,
@@ -65,6 +96,15 @@ def _iter_files(
         if exclude_glob and fnmatch.fnmatch(rel, exclude_glob):
             continue
         yield path, rel
+
+
+def _matches_any(rel: str, patterns: Optional[Iterable[str]]) -> bool:
+    if not patterns:
+        return False
+    for pattern in patterns:
+        if fnmatch.fnmatch(rel, pattern):
+            return True
+    return False
 
 
 def _read_text_lines(path: Path) -> List[str]:
@@ -129,7 +169,7 @@ def tree_summary(
     *,
     max_depth: int = 4,
     include_files: bool = True,
-    exclude_glob: Optional[str] = None,
+    exclude_globs: Optional[Iterable[str]] = None,
 ) -> Dict[str, str]:
     root = Path(root_dir).resolve()
 
@@ -148,8 +188,10 @@ def tree_summary(
         children: List[Dict[str, object]] = []
         entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
         for entry in entries:
+            if entry.is_dir() and entry.name in DEFAULT_TREE_EXCLUDE_DIR_NAMES:
+                continue
             rel = entry.relative_to(root).as_posix()
-            if exclude_glob and fnmatch.fnmatch(rel, exclude_glob):
+            if _matches_any(rel, exclude_globs):
                 continue
             if entry.is_file() and not include_files:
                 continue
@@ -414,6 +456,7 @@ async def tree_summary_tool(
         max_depth: Maximum depth to traverse.
         include_files: If True, include files; otherwise show directories only.
         exclude_glob: Optional glob to exclude entries (relative to root_dir).
+            If omitted, defaults exclude: .git, .venv, node_modules.
 
     Returns:
         JSON string encoding an object: {"tree": {...}} with a structured tree.
@@ -422,11 +465,15 @@ async def tree_summary_tool(
     Usage:
         await tree_summary_tool("/repo", max_depth=3, exclude_glob="**/node_modules/**")
     """
+    exclude_globs = list(DEFAULT_TREE_EXCLUDE_GLOBS)
+    if exclude_glob is not None:
+        exclude_globs.append(exclude_glob)
+
     results = tree_summary(
         root_dir,
         max_depth=max_depth,
         include_files=include_files,
-        exclude_glob=exclude_glob,
+        exclude_globs=exclude_globs,
     )
     return _to_json_str(results)
 
