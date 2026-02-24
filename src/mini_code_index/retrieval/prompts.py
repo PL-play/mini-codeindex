@@ -43,6 +43,11 @@ These are listed to help you plan scope and task decomposition. Do NOT prescribe
 
 <Output Format>
 Return valid JSON with these keys (include concise, explicit content):
+  - objective: str = Field(description="Core goal of the retrieval task")
+  - focus: str = Field(description="Key aspects or scope boundaries to emphasize")
+  - success_criteria: str = Field(description="What a good answer should cover")
+  - sub_tasks: List["SubTask"] = Field(description="List of sub-questions/tasks to run")
+An example: 
 {
   "objective": "The core goal of this retrieval (what the user ultimately wants).",
   "focus": "Key scope boundaries or emphasis (what to include/exclude or prioritize).",

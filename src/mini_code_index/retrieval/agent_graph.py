@@ -320,7 +320,14 @@ async def planner_node(state: RetrievalAgentState) -> Command:
     if resp.parse_error or not resp.json_data:
         raise ValueError(f"planner_json_parse_failed: {resp.parse_error or 'empty_json'}")
 
-    plan_model = RetrievalPlan.model_validate(resp.json_data)
+    try:
+        plan_model = RetrievalPlan.model_validate(resp.json_data)
+    except Exception:
+        logger.exception(
+            "[planner] plan_validate_failed json=%s",
+            _truncate(json.dumps(resp.json_data, ensure_ascii=False, default=str), 2000),
+        )
+        raise
     plan_dict = plan_model.model_dump()
     sub_tasks = [task.model_dump() for task in plan_model.sub_tasks]
 
@@ -681,8 +688,13 @@ async def synthesize_node(state: SubtaskState) -> Command:
             result_model = SubtaskResult.model_validate(resp.json_data)
             result_dict = result_model.model_dump()
             logger.info("%s synthesize_result %s", prefix, result_dict)
-        except Exception as e:
-            logger.warning("%s synthesize_validate_failed error=%s", prefix, e)
+        except Exception:
+            logger.exception(
+                "%s synthesize_validate_failed json=%s",
+                prefix,
+                _truncate(json.dumps(resp.json_data, ensure_ascii=False, default=str), 2000),
+            )
+            raise
 
     report_path = _safe_filename(name or instruction or "subtask")
     try:
