@@ -29,8 +29,7 @@ def _pretty_json(raw_json: str) -> str:
 class TestLocalSearchTools(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        project_root = Path(__file__).resolve().parents[1]
-        cls.test_code_dir = project_root / "test_code_index_project"
+        cls.test_code_dir = str(Path(__file__).resolve().parent / "test_code_index_project")
 
     def test_text_search_tool(self) -> None:
         result = asyncio.run(
@@ -38,10 +37,69 @@ class TestLocalSearchTools(unittest.TestCase):
                 str(self.test_code_dir),
                 "UserService",
                 include_glob="src/**/*.java",
-                max_results=5,
+                mode="file_summary",
+                page=1,
+                page_size=20,
             )
         )
-        print("text_search_tool result:\n", _pretty_json(result))
+        print("text_search_tool(file_summary) result:\n", _pretty_json(result))
+
+    def test_text_search_tool_hits_mode(self) -> None:
+        summary_raw = asyncio.run(
+            text_search_tool(
+                str(self.test_code_dir),
+                "UserService",
+                include_glob="src/**/*.java",
+                mode="file_summary",
+                page=1,
+                page_size=10,
+            )
+        )
+        summary = json.loads(summary_raw)
+        top_paths = [item.get("path", "") for item in summary.get("items", [])[:3] if item.get("path")]
+
+        result = asyncio.run(
+            text_search_tool(
+                str(self.test_code_dir),
+                "UserService",
+                mode="hits",
+                file_paths=top_paths,
+                per_file_hit_cap=2,
+                page=1,
+                page_size=20,
+            )
+        )
+        print("text_search_tool(hits) result:\n", _pretty_json(result))
+
+    def test_text_search_tool_full_mode(self) -> None:
+        summary_raw = asyncio.run(
+            text_search_tool(
+                str(self.test_code_dir),
+                "UserService",
+                include_glob="src/**/*.java",
+                mode="file_summary",
+                page=1,
+                page_size=10,
+            )
+        )
+        summary = json.loads(summary_raw)
+        top_path = ""
+        items = summary.get("items", [])
+        if items:
+            top_path = str(items[0].get("path", ""))
+
+        result = asyncio.run(
+            text_search_tool(
+                str(self.test_code_dir),
+                "UserService",
+                mode="full",
+                file_paths=[top_path] if top_path else None,
+                context_lines=1,
+                page=1,
+                page_size=10,
+            )
+        )
+        print("text_search_tool(full) result:\n", _pretty_json(result))
 
     def test_path_glob_tool(self) -> None:
         result = asyncio.run(path_glob_tool(str(self.test_code_dir), "src/**/*.py"))
